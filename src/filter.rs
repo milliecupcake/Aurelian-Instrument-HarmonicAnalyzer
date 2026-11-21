@@ -1,4 +1,4 @@
-//! 試聴用の周波数帯フィルタ。
+//! 試聴用のフィルタ。周波数帯で指定するものと、選んだ倍音の周りだけを残すものがある。
 //!
 //! 録音全体を一度に FFT し、周波数ごとのゲインを掛けて戻す（位相は変えない）。
 //! 境界は二乗余弦でなだらかにつなぎ、急峻な遮断による「リンギング」を抑える。
@@ -20,6 +20,23 @@ pub struct Band {
     pub low_hz: f64,
     pub high_hz: f64,
     pub mode: BandMode,
+}
+
+/// 選んだ倍音（k·f0 ± 幅）だけを残し、ほかの周波数はすべて取り除く
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarmonicKeep {
+    pub f0: f64,
+    /// 残す倍音の番号
+    pub harmonics: Vec<usize>,
+    /// 各倍音の周りに残す幅（片側、Hz）
+    pub half_width_hz: f64,
+}
+
+/// 試聴フィルタの種類と設定
+#[derive(Clone, Debug, PartialEq)]
+pub enum Filter {
+    Band(Band),
+    Harmonics(HarmonicKeep),
 }
 
 pub fn transition_width(edge_hz: f64) -> f64 {
@@ -47,8 +64,33 @@ pub fn gain(band: &Band, f: f64) -> f64 {
     }
 }
 
+/// 0, bin_hz, 2·bin_hz, … の各周波数でのゲイン
+fn gains(filter: &Filter, bins: usize, bin_hz: f64) -> Vec<f32> {
+    match filter {
+        Filter::Band(band) => (0..bins).map(|b| gain(band, b as f64 * bin_hz) as f32).collect(),
+        Filter::Harmonics(h) => {
+            let mut g = vec![0f32; bins];
+            if h.f0 <= 0.0 {
+                return g;
+            }
+            // 各倍音の周りの帯（境界はなだらか）を重ね、重なる所は大きいほうを使う
+            for &k in &h.harmonics {
+                let c = k as f64 * h.f0;
+                let band = Band { low_hz: c - h.half_width_hz, high_hz: c + h.half_width_hz, mode: BandMode::Keep };
+                let reach = h.half_width_hz + transition_width(c + h.half_width_hz);
+                let b0 = ((c - reach) / bin_hz).floor().max(0.0) as usize;
+                let b1 = (((c + reach) / bin_hz).ceil() as usize).min(bins.saturating_sub(1));
+                for (b, v) in g.iter_mut().enumerate().take(b1 + 1).skip(b0) {
+                    *v = v.max(gain(&band, b as f64 * bin_hz) as f32);
+                }
+            }
+            g
+        }
+    }
+}
+
 /// インターリーブされた音声にフィルタを掛ける。
-pub fn apply(interleaved: &[f32], channels: usize, sample_rate: u32, band: &Band) -> Vec<f32> {
+pub fn apply(interleaved: &[f32], channels: usize, sample_rate: u32, filter: &Filter) -> Vec<f32> {
     let channels = channels.max(1);
     let frames = interleaved.len() / channels;
     if frames == 0 {
@@ -62,7 +104,7 @@ pub fn apply(interleaved: &[f32], channels: usize, sample_rate: u32, band: &Band
     let mut buf = fwd.make_input_vec();
     let mut spec = fwd.make_output_vec();
     let bin_hz = sample_rate as f64 / n as f64;
-    let gains: Vec<f32> = (0..spec.len()).map(|b| gain(band, b as f64 * bin_hz) as f32).collect();
+    let gains = gains(filter, spec.len(), bin_hz);
     let mut out = vec![0f32; interleaved.len()];
 
     for c in 0..channels {
@@ -90,7 +132,7 @@ pub fn apply(interleaved: &[f32], channels: usize, sample_rate: u32, band: &Band
 mod tests {
     use super::*;
     use crate::analysis::{WindowSize, analyze};
-    use crate::test_tones::{SR, inharmonic_750};
+    use crate::test_tones::{SR, inharmonic_750, sine_220_plus_half_440};
 
     fn levels(x: &[f32]) -> (f32, f32) {
         let a = analyze(x, SR, 220.0, WindowSize::Auto).unwrap();
@@ -103,7 +145,7 @@ mod tests {
     fn keep_band_isolates_750() {
         let x = inharmonic_750();
         let (h1, c750) = levels(&x);
-        let y = apply(&x, 1, SR, &Band { low_hz: 600.0, high_hz: 900.0, mode: BandMode::Keep });
+        let y = apply(&x, 1, SR, &Filter::Band(Band { low_hz: 600.0, high_hz: 900.0, mode: BandMode::Keep }));
         let (h1f, c750f) = levels(&y);
         assert!(h1f < h1 - 80.0, "220 Hz が残っている: {h1} → {h1f}");
         assert!((c750f - c750).abs() < 0.1, "750 Hz が変わった: {c750} → {c750f}");
@@ -113,17 +155,56 @@ mod tests {
     fn remove_band_drops_only_750() {
         let x = inharmonic_750();
         let (h1, _) = levels(&x);
-        let y = apply(&x, 1, SR, &Band { low_hz: 600.0, high_hz: 900.0, mode: BandMode::Remove });
+        let y = apply(&x, 1, SR, &Filter::Band(Band { low_hz: 600.0, high_hz: 900.0, mode: BandMode::Remove }));
+        let (h1f, c750f) = levels(&y);
+        assert!((h1f - h1).abs() < 0.1, "220 Hz が変わった: {h1} → {h1f}");
+        assert!(c750f < -90.0, "750 Hz が残っている: {c750f}");
+    }
+
+    fn keep(harmonics: &[usize]) -> Filter {
+        Filter::Harmonics(HarmonicKeep { f0: 220.0, harmonics: harmonics.to_vec(), half_width_hz: 55.0 })
+    }
+
+    #[test]
+    fn harmonic_keep_drops_unselected_harmonics() {
+        let x = sine_220_plus_half_440();
+        let at = |y: &[f32], k: usize| {
+            let a = analyze(y, SR, 220.0, WindowSize::Auto).unwrap();
+            a.level_db(a.frame_at(1.0), k).unwrap()
+        };
+        let (h1, h2) = (at(&x, 1), at(&x, 2));
+        // 第1倍音だけ残す
+        let y = apply(&x, 1, SR, &keep(&[1]));
+        assert!((at(&y, 1) - h1).abs() < 0.1, "第1倍音が変わった");
+        assert!(at(&y, 2) < h2 - 80.0, "第2倍音が残っている: {}", at(&y, 2));
+        // 第2倍音だけ残す
+        let y = apply(&x, 1, SR, &keep(&[2]));
+        assert!(at(&y, 1) < h1 - 80.0, "第1倍音が残っている: {}", at(&y, 1));
+        assert!((at(&y, 2) - h2).abs() < 0.1, "第2倍音が変わった");
+    }
+
+    #[test]
+    fn harmonic_keep_drops_inharmonic_component() {
+        // 750 Hz は第3（660 Hz）と第4（880 Hz）の間なので、第1〜第8倍音を残しても消える
+        let x = inharmonic_750();
+        let (h1, _) = levels(&x);
+        let y = apply(&x, 1, SR, &keep(&(1..=8).collect::<Vec<_>>()));
         let (h1f, c750f) = levels(&y);
         assert!((h1f - h1).abs() < 0.1, "220 Hz が変わった: {h1} → {h1f}");
         assert!(c750f < -90.0, "750 Hz が残っている: {c750f}");
     }
 
     #[test]
+    fn harmonic_keep_with_nothing_selected_is_silent() {
+        let y = apply(&inharmonic_750(), 1, SR, &keep(&[]));
+        assert!(y.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
     fn stereo_channels_stay_separate() {
         // 両端がフェードした 220 Hz を左だけに入れる
         let x: Vec<f32> = crate::test_tones::sine_220().into_iter().flat_map(|v| [v, 0.0]).collect();
-        let y = apply(&x, 2, SR, &Band { low_hz: 0.0, high_hz: 20000.0, mode: BandMode::Keep });
+        let y = apply(&x, 2, SR, &Filter::Band(Band { low_hz: 0.0, high_hz: 20000.0, mode: BandMode::Keep }));
         assert!(y.iter().skip(1).step_by(2).all(|v| v.abs() < 1e-4));
         let d = x.iter().zip(&y).step_by(2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         assert!(d < 1e-3, "通過域で波形が変わった: {d}");
