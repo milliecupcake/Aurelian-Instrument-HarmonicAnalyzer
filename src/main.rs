@@ -29,6 +29,10 @@ const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
 const KEEP_COLOR: Color32 = Color32::from_rgb(80, 220, 255);
 const REMOVE_COLOR: Color32 = Color32::from_rgb(255, 90, 90);
 const LIVE_COLOR: Color32 = Color32::from_rgb(255, 110, 110);
+/// OFF の倍音の棒（半透明の灰色）
+const OFF_BAR_COLOR: Color32 = Color32::from_rgba_premultiplied(45, 45, 45, 75);
+/// OFF の倍音の行の文字の濃さ（不透明度）
+const OFF_TEXT_ALPHA: f32 = 0.35;
 const WINDOW_CHOICES: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
 const PALETTE: [Color32; 10] = [
     Color32::from_rgb(86, 156, 255),
@@ -1245,7 +1249,8 @@ impl App {
             .map(|k| {
                 let db = a.level_db(frame, k).unwrap() as f64;
                 let on = self.shown.contains(k);
-                let fill = if on { harmonic_color(k) } else { Color32::from_gray(110) };
+                // OFF の倍音は半透明の灰色にして、ON の倍音を目立たせる
+                let fill = if on { harmonic_color(k) } else { OFF_BAR_COLOR };
                 let mut b = Bar::new(k as f64, db - FLOOR_DB as f64)
                     .base_offset(FLOOR_DB as f64)
                     .width(2.0 * BAR_HALF_WIDTH)
@@ -1431,11 +1436,14 @@ impl App {
                         self.shown.set(k, on);
                     }
                     let focused = self.focused == Some(k);
+                    // OFF・範囲外の行は、名前も数値も半透明にして沈める
                     let color = match (in_range, on) {
-                        (false, _) => Color32::GRAY,
+                        (false, _) => Color32::GRAY.gamma_multiply(OFF_TEXT_ALPHA),
                         (true, true) => harmonic_color(k),
-                        (true, false) => harmonic_color(k).gamma_multiply(0.55),
+                        (true, false) => harmonic_color(k).gamma_multiply(OFF_TEXT_ALPHA),
                     };
+                    let text_color = if on { ui.visuals().text_color() } else { ui.visuals().text_color().gamma_multiply(OFF_TEXT_ALPHA) };
+                    let cell = |text: String| RichText::new(text).color(text_color);
                     let mut name = RichText::new(format!("{}■ 第{k}倍音", if focused { "▶ " } else { "" })).color(color);
                     if focused {
                         name = name.strong();
@@ -1443,14 +1451,14 @@ impl App {
                     if ui.selectable_label(focused, name).on_hover_text("クリックで注目").clicked() {
                         self.focused = Some(k);
                     }
-                    ui.label(format!("{:.2} Hz", a.harmonic_hz(k)));
+                    ui.label(cell(format!("{:.2} Hz", a.harmonic_hz(k))));
                     match a.level(frame, k) {
                         HarmonicLevel::Level { db, peak_hz } => {
-                            ui.label(format!("{peak_hz:.2} Hz"));
-                            ui.label(fmt_db(db));
+                            ui.label(cell(format!("{peak_hz:.2} Hz")));
+                            ui.label(cell(fmt_db(db)));
                         }
                         HarmonicLevel::OutOfRange => {
-                            ui.label(RichText::new("範囲外").color(Color32::GRAY));
+                            ui.label(cell("範囲外".into()));
                             ui.label("");
                         }
                     }
@@ -1600,7 +1608,7 @@ impl App {
                 if self.show_harmonic_guides {
                     for k in 1..=self.bar_count.min(a.num_in_range) {
                         let on = self.shown.contains(k);
-                        let c = if on { harmonic_color(k) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 50) };
+                        let c = if on { harmonic_color(k) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 22) };
                         pu.hline(
                             HLine::new(format!("第{k}倍音"), k as f64 * f0)
                                 .color(c)
