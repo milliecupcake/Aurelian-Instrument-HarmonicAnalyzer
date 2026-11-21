@@ -9,3 +9,6 @@ pub mod harmonics;
 pub mod live;
 #[cfg(target_os = "macos")]
 pub mod app_tap;
+pub mod colors;
+pub mod export;
+pub mod fonts;

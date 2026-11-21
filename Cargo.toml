@@ -4,13 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ab_glyph = "0.2.32"
 cpal = "0.18.2"
 eframe = "0.37.0"
 egui_plot = "0.38.0"
+epaint_default_fonts = "0.37.0"
 hound = "3.5.1"
 png = "0.18.1"
 realfft = "3.5.1"
 rfd = "0.18.0"
+serde_json = "1"
+tiny-skia = "0.11.4"
+zip = { version = "9.4.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # アプリの音の取り込み（Core Audio のプロセスタップ、macOS 14.2 以降）
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -20,3 +25,6 @@ objc2-core-audio = { version = "0.3", default-features = false, features = ["std
 objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
 objc2-core-foundation = "0.3"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSValue", "NSUUID"] }
+
+[dev-dependencies]
+csv = "1"
