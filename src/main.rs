@@ -7,7 +7,7 @@ use egui_plot::{
 };
 use harmonic_analyzer::analysis::{Analysis, FLOOR_DB, HarmonicLevel, WindowSize, analyze, auto_window};
 use harmonic_analyzer::audio_file::{AudioClip, load_wav, write_wav_mono};
-use harmonic_analyzer::filter::{self, Band, BandMode};
+use harmonic_analyzer::filter::{self, Band, BandMode, Filter, HarmonicKeep};
 use harmonic_analyzer::harmonics::{BAR_HALF_WIDTH, DEFAULT_ON, RangeOp, Shown, harmonics_in_span};
 use harmonic_analyzer::live::{AppInfo, LiveInput, Source, audio_apps, input_device_names};
 use harmonic_analyzer::note::{nearest_note, parse_pitch};
@@ -168,6 +168,15 @@ enum BandEdge {
     High,
 }
 
+/// 試聴フィルタの種類
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterKind {
+    /// 周波数帯で指定する
+    Band,
+    /// 倍音一覧で選んでいない倍音（と倍音以外の成分）を取り除く
+    Harmonics,
+}
+
 /// 倍音分布の上で範囲選択した横軸の位置（倍音番号。a = ドラッグ開始, b = 現在／終了）
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Pick {
@@ -256,9 +265,12 @@ struct App {
 
     /// 試聴フィルタ（再生音だけに掛ける）
     filter_on: bool,
+    filter_kind: FilterKind,
     band: Band,
+    /// 「選択していない倍音をカット」で各倍音の周りに残す幅（片側、基音に対する %）
+    harm_width_pct: f64,
     /// いまプレーヤーに入っている音に掛かっているフィルタ（None = 元の音）
-    filter_applied: Option<Band>,
+    filter_applied: Option<Filter>,
     /// スペクトログラム上で Shift+ドラッグ中の開始周波数
     band_drag_start: Option<f64>,
     /// スペクトログラム上で境界線にカーソルが乗っているか（前フレーム）
@@ -319,7 +331,9 @@ impl Default for App {
             show_settings: true,
             show_help: false,
             filter_on: false,
+            filter_kind: FilterKind::Band,
             band: Band { low_hz: 600.0, high_hz: 900.0, mode: BandMode::Keep },
+            harm_width_pct: 25.0,
             filter_applied: None,
             band_drag_start: None,
             edge_hover: None,
@@ -379,18 +393,36 @@ impl App {
         self.reanalyze();
     }
 
+    /// いまの設定で再生音に掛けるべきフィルタ（無効なら None）
+    fn wanted_filter(&self) -> Option<Filter> {
+        if !self.filter_on {
+            return None;
+        }
+        Some(match self.filter_kind {
+            FilterKind::Band => Filter::Band(self.band),
+            FilterKind::Harmonics => {
+                let a = self.analysis.as_ref()?;
+                Filter::Harmonics(HarmonicKeep {
+                    f0: a.f0,
+                    harmonics: self.shown.in_range(a.num_in_range).collect(),
+                    half_width_hz: a.f0 * self.harm_width_pct / 100.0,
+                })
+            }
+        })
+    }
+
     /// フィルタ設定が変わっていて、マウスを離していれば、再生する音を作り直す
     fn sync_filter(&mut self, ctx: &egui::Context) {
         if self.live.is_some() {
             return;
         }
+        let wanted = self.wanted_filter();
         let Some(clip) = &self.clip else { return };
-        let wanted = self.filter_on.then_some(self.band);
         if wanted == self.filter_applied || ctx.input(|i| i.pointer.any_down()) {
             return;
         }
         let data = match &wanted {
-            Some(b) => filter::apply(&clip.interleaved, clip.channels, clip.sample_rate, b),
+            Some(f) => filter::apply(&clip.interleaved, clip.channels, clip.sample_rate, f),
             None => clip.interleaved.clone(),
         };
         self.player.replace_audio(data, clip.channels, clip.sample_rate);
@@ -701,10 +733,14 @@ impl App {
         if let Some(t) = var("HA_CURSOR").map(|v| v.parse::<f64>().unwrap_or(0.0)) {
             self.set_cursor(t);
         }
-        // 例: HA_FILTER=600-900 または 600-900:cut
+        // 例: HA_FILTER=600-900 または 600-900:cut、HA_FILTER=harm（選択していない倍音をカット）や harm:10（幅 ±10%）
         if let Some(f) = var("HA_FILTER") {
             let (range, mode) = f.split_once(':').unwrap_or((&f, "keep"));
-            if let Some((lo, hi)) = range.split_once('-') {
+            if range == "harm" {
+                self.filter_kind = FilterKind::Harmonics;
+                self.harm_width_pct = mode.parse().unwrap_or(self.harm_width_pct);
+                self.filter_on = true;
+            } else if let Some((lo, hi)) = range.split_once('-') {
                 self.band.low_hz = lo.parse().unwrap_or(0.0);
                 self.band.high_hz = hi.parse().unwrap_or(0.0);
                 self.band.mode = if mode == "cut" { BandMode::Remove } else { BandMode::Keep };
@@ -868,6 +904,19 @@ impl App {
             )
         } else if !self.filter_on {
             ("試聴: 元の音".to_string(), ui.visuals().text_color(), "再生音にフィルタは掛かっていない")
+        } else if self.filter_kind == FilterKind::Harmonics {
+            match self.analysis.as_ref().map(|a| self.shown.in_range(a.num_in_range).count()) {
+                Some(0) | None => (
+                    "試聴: 選択中の倍音なし（無音）".to_string(),
+                    REMOVE_COLOR,
+                    "倍音一覧で1本も選んでいないので、すべてカットしている",
+                ),
+                Some(n) => (
+                    format!("試聴: 選択中の {n} 倍音だけ"),
+                    KEEP_COLOR,
+                    "倍音一覧でチェックした倍音の周りだけを鳴らし、ほかの倍音と倍音以外の成分はカットしている",
+                ),
+            }
         } else {
             match self.band.mode {
                 BandMode::Keep => (format!("試聴: {lo:.0}–{hi:.0} Hz だけ"), KEEP_COLOR, "この帯域だけを鳴らしている"),
@@ -875,7 +924,7 @@ impl App {
             }
         };
         ui.label(RichText::new(text).color(color)).on_hover_text(format!("{tip}\n解析・グラフは常に元の音"));
-        if self.filter_on && self.live.is_none() && Some(self.band) != self.filter_applied && self.clip.is_some() {
+        if self.filter_on && self.live.is_none() && self.wanted_filter() != self.filter_applied && self.clip.is_some() {
             ui.spinner().on_hover_text("フィルタを掛けた音を準備中");
         }
     }
@@ -995,6 +1044,27 @@ impl App {
                     ui.checkbox(&mut self.filter_on, RichText::new("試聴フィルタ").strong())
                         .on_hover_text("再生する音だけに掛かる。解析・グラフは元の音のまま");
                     ui.add_enabled_ui(self.filter_on, |ui| {
+                        egui::ComboBox::from_id_salt("filter-kind")
+                            .selected_text(match self.filter_kind {
+                                FilterKind::Band => "帯域で指定",
+                                FilterKind::Harmonics => "選択していない倍音をカット",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.filter_kind, FilterKind::Band, "帯域で指定")
+                                    .on_hover_text("周波数の範囲を指定して、その帯域だけ聴く／除く");
+                                ui.selectable_value(&mut self.filter_kind, FilterKind::Harmonics, "選択していない倍音をカット")
+                                    .on_hover_text("倍音一覧でチェックした倍音の周りだけを残し、ほかはすべてカットする");
+                            });
+                        if self.filter_kind == FilterKind::Harmonics {
+                            ui.label("幅 ±");
+                            ui.add(egui::DragValue::new(&mut self.harm_width_pct).range(2.0..=50.0).speed(0.5).suffix(" %").max_decimals(0))
+                                .on_hover_text("各倍音の周りに残す幅（基音の周波数に対する割合）。50% で隣の倍音との中間まで");
+                            if let Some(a) = &self.analysis {
+                                let n = self.shown.in_range(a.num_in_range).count();
+                                ui.label(hint(ui, format!("（±{:.0} Hz、選択中 {n} 本を残す）", a.f0 * self.harm_width_pct / 100.0)));
+                            }
+                            return;
+                        }
                         ui.selectable_value(&mut self.band.mode, BandMode::Keep, "この帯域だけ聴く")
                             .on_hover_text("指定した帯域だけを残す（バンドパス）。スペクトログラムでは水色");
                         ui.selectable_value(&mut self.band.mode, BandMode::Remove, "この帯域を除く")
@@ -1020,7 +1090,8 @@ impl App {
                     ui.label(hint(ui, "ライブ中は使えない（停止すると使える）"));
                 } else {
                     ui.label(hint(ui, "？")).on_hover_text(format!(
-                        "スペクトログラムで Shift+ドラッグすると範囲を指定できる。帯の上下の線は個別にドラッグできる。\n\
+                        "帯域で指定: スペクトログラムで Shift+ドラッグすると範囲を指定できる。帯の上下の線は個別にドラッグできる。\n\
+                         選択していない倍音をカット: 倍音一覧のチェックを変えると、すぐに鳴る音も変わる。\n\
                          境界はなだらかで、境界の幅は {:.0}〜{:.0} Hz",
                         filter::transition_width(self.band.low_hz),
                         filter::transition_width(self.band.high_hz)
@@ -1634,7 +1705,14 @@ impl App {
         let fmax = (f0 * (self.bar_count.min(16) as f64 + 1.0)).clamp(1000.0, nyq); // 既定は第16倍音付近まで
         let spec = &a.spectrogram;
         let shift = ui.input(|i| i.modifiers.shift);
-        let band = self.filter_on.then_some(self.band);
+        let band = (self.filter_on && self.filter_kind == FilterKind::Band).then_some(self.band);
+        // 「選択していない倍音をカット」で残る帯
+        let kept: Vec<(f64, f64)> = match self.wanted_filter() {
+            Some(Filter::Harmonics(h)) => {
+                h.harmonics.iter().map(|&k| (k as f64 * h.f0 - h.half_width_hz, k as f64 * h.f0 + h.half_width_hz)).collect()
+            }
+            _ => Vec::new(),
+        };
         let drag_start = self.band_drag_start;
         let edge_drag = self.edge_drag;
         // 境界線をつかんでいる間・つかめる位置にある間はグラフ自体を動かさない
@@ -1686,6 +1764,14 @@ impl App {
                             .axis(egui_plot::Axis::Y)
                             .fill(fill)
                             .border(Stroke::new(1.5, edge)),
+                    );
+                }
+                for &(lo, hi) in &kept {
+                    pu.span(
+                        Span::new("", lo..=hi)
+                            .axis(egui_plot::Axis::Y)
+                            .fill(Color32::from_rgba_unmultiplied(80, 220, 255, 30))
+                            .border(Stroke::new(0.8, KEEP_COLOR.gamma_multiply(0.6))),
                     );
                 }
                 draw_cursors(pu);
@@ -1756,6 +1842,7 @@ impl App {
                 self.band.low_hz = lo;
                 self.band.high_hz = hi;
                 self.filter_on = true;
+                self.filter_kind = FilterKind::Band;
             }
         }
 
