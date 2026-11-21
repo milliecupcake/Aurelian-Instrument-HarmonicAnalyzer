@@ -1,4 +1,4 @@
-//! AI や外部の解析プログラム向けの書き出し（AI_ANALYSIS_EXPORT_TASKS の P1・P2）。
+//! AI や外部の解析プログラム向けの書き出し（AI_ANALYSIS_EXPORT_TASKS の P1〜P3）。
 //!
 //! 書き出し開始時点の音声・解析結果・設定・画面の状態を `Snapshot` に固定し、
 //! そこから次のファイルを 1 つの ZIP にまとめる。
@@ -7,7 +7,9 @@
 //! - `manifest.json`  解析条件・音源情報・表示と試聴の状態・データ形式の説明
 //! - `harmonics.csv`  解析範囲内の全倍音 × 全フレームの数値（基音に対する相対レベルつき）
 //! - `features.csv`   倍音ごとの特徴量（最大・持続区間の代表値・相対レベル・減衰時間）
-//! - `envelope.csv`   フレームごとの RMS・ピーク・スペクトル重心
+//! - `envelope.csv`   フレームごとの RMS・ピーク・スペクトル重心・倍音のパワーの割合
+//! - `pitch_track.csv` 約 10 ms ごとの基音推定（参考値。倍音解析は固定基音のまま）
+//! - `partials.csv`   同じ時刻の、スペクトルの局所ピークと整数倍との関係（非整数倍の成分を含む）
 //! - `overview.png`   波形・スペクトログラム・倍音の時間変化
 //! - `summary.txt`    主要な数値・制約・利用者の入力した背景と質問
 //!
@@ -21,6 +23,7 @@ pub mod features;
 mod manifest;
 mod overview;
 mod summary;
+pub mod tracks;
 
 use crate::analysis::{Analysis, HarmonicLevel, WindowSize, analyze};
 use crate::audio_file::AudioClip;
@@ -36,7 +39,7 @@ pub use overview::render_overview;
 pub use summary::{HarmonicStats, harmonic_stats};
 
 /// 出力形式の版。列や項目の意味を変えたら上げる
-pub const SCHEMA_VERSION: &str = "1.1.0";
+pub const SCHEMA_VERSION: &str = "1.2.0";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const FILE_WAV: &str = "source.wav";
@@ -46,9 +49,20 @@ pub const FILE_OVERVIEW: &str = "overview.png";
 pub const FILE_SUMMARY: &str = "summary.txt";
 pub const FILE_FEATURES: &str = "features.csv";
 pub const FILE_ENVELOPE: &str = "envelope.csv";
+pub const FILE_PITCH: &str = "pitch_track.csv";
+pub const FILE_PARTIALS: &str = "partials.csv";
 /// ZIP に入るファイル（この順で書く）
-pub const FILES: [&str; 7] =
-    [FILE_MANIFEST, FILE_SUMMARY, FILE_FEATURES, FILE_ENVELOPE, FILE_CSV, FILE_WAV, FILE_OVERVIEW];
+pub const FILES: [&str; 9] = [
+    FILE_MANIFEST,
+    FILE_SUMMARY,
+    FILE_FEATURES,
+    FILE_ENVELOPE,
+    FILE_PITCH,
+    FILE_PARTIALS,
+    FILE_CSV,
+    FILE_WAV,
+    FILE_OVERVIEW,
+];
 
 /// harmonics.csv の列（この順）
 pub const CSV_COLUMNS: [&str; 11] = [
@@ -88,8 +102,16 @@ pub const FEATURE_COLUMNS: [&str; 18] = [
 ];
 
 /// envelope.csv の列（この順）
-pub const ENVELOPE_COLUMNS: [&str; 7] =
-    ["frame_index", "time_s", "rms_db", "peak_db", "spectral_centroid_hz", "edge_padded", "samples_used"];
+pub const ENVELOPE_COLUMNS: [&str; 8] = [
+    "frame_index",
+    "time_s",
+    "rms_db",
+    "peak_db",
+    "spectral_centroid_hz",
+    "harmonic_power_ratio",
+    "edge_padded",
+    "samples_used",
+];
 
 /// 音源の種類
 #[derive(Clone, Debug, PartialEq)]
@@ -372,24 +394,31 @@ fn write_zip_file(snap: &Snapshot, path: &Path, cjk_font: Option<&[u8]>, progres
     progress.set(0.0);
 
     let feats = features::compute(snap);
+    let tracks = tracks::compute(snap, progress)?;
+    progress.set(0.08);
     zip.start_file(FILE_MANIFEST, deflated).map_err(zip_fail)?;
-    let json =
-        serde_json::to_string_pretty(&manifest::build(snap, &feats)).map_err(|e| ExportError::Failed(e.to_string()))?;
+    let json = serde_json::to_string_pretty(&manifest::build(snap, &feats, &tracks))
+        .map_err(|e| ExportError::Failed(e.to_string()))?;
     zip.write_all(json.as_bytes()).map_err(fail("manifest.json"))?;
 
     zip.start_file(FILE_SUMMARY, deflated).map_err(zip_fail)?;
-    zip.write_all(summary::build(snap, &feats).as_bytes()).map_err(fail("summary.txt"))?;
+    zip.write_all(summary::build(snap, &feats, &tracks).as_bytes()).map_err(fail("summary.txt"))?;
 
     zip.start_file(FILE_FEATURES, deflated).map_err(zip_fail)?;
     write_features_csv(snap, &feats, &mut zip)?;
     zip.start_file(FILE_ENVELOPE, deflated).map_err(zip_fail)?;
     write_envelope_csv(snap, &feats, &mut zip)?;
-    progress.set(0.04);
+    zip.start_file(FILE_PITCH, deflated).map_err(zip_fail)?;
+    tracks::write_pitch_csv(snap, &tracks, &mut zip)?;
+    let big_partials = tracks.partials.rows.len() as u64 * 160 > u32::MAX as u64;
+    zip.start_file(FILE_PARTIALS, deflated.large_file(big_partials)).map_err(zip_fail)?;
+    tracks::write_partials_csv(snap, &tracks, &mut zip)?;
+    progress.set(0.12);
 
     // CSV は 1 行 100 バイト前後。4 GiB を超えそうなら ZIP64 にする
     let big = snap.csv_rows() as u64 * 120 > u32::MAX as u64;
     zip.start_file(FILE_CSV, deflated.large_file(big)).map_err(zip_fail)?;
-    write_csv(snap, &mut zip, |f| progress.set(0.04 + 0.66 * f), progress)?;
+    write_csv(snap, &mut zip, |f| progress.set(0.12 + 0.58 * f), progress)?;
 
     zip.start_file(FILE_WAV, stored.large_file(snap.clip.interleaved.len() as u64 * 4 > u32::MAX as u64 / 2))
         .map_err(zip_fail)?;
@@ -535,6 +564,8 @@ fn write_envelope_csv(snap: &Snapshot, feats: &features::Features, w: &mut impl 
         num32(&mut o, e.peak_db[f]);
         o.push(',');
         opt(&mut o, a.spectral_centroid(f));
+        o.push(',');
+        opt(&mut o, a.harmonic_power_ratio(f));
         let _ = writeln!(o, ",{},{}", a.is_edge_padded(f), e.samples_used[f]);
     }
     w.write_all(o.as_bytes()).map_err(fail("envelope.csv"))

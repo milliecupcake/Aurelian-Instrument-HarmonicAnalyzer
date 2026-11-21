@@ -129,6 +129,8 @@ pub struct Analysis {
     status: Vec<PeakStatus>,
     /// フレームごとのスペクトル重心（Hz）。無音なら None
     centroid: Vec<Option<f32>>,
+    /// フレームごとの、検出した倍音のパワーの割合。無音なら None
+    harmonic_ratio: Vec<Option<f32>>,
     pub spectrogram: Spectrogram,
 }
 
@@ -152,6 +154,13 @@ impl Analysis {
     /// どのビンも下限（−120 dB）以下のフレーム（無音）は None
     pub fn spectral_centroid(&self, frame: usize) -> Option<f64> {
         self.centroid.get(frame).copied().flatten().map(f64::from)
+    }
+
+    /// 検出した倍音のパワーの割合 = Σ（detected_peak の振幅² / 2）÷ フレームのパワー。
+    /// フレームのパワーは窓を掛けた信号の平均 2 乗（DC を除く。Parseval でスペクトルから求める）。
+    /// 倍音だけの定常音でほぼ 1、非整数倍の成分や雑音があると小さくなる。無音なら None
+    pub fn harmonic_power_ratio(&self, frame: usize) -> Option<f64> {
+        self.harmonic_ratio.get(frame).copied().flatten().map(f64::from)
     }
 
     /// 窓の中心の時刻（秒）
@@ -223,24 +232,11 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
     let bins = m / 2 + 1;
     let bin_hz = fs / m as f64;
 
-    // 4項 Blackman-Harris 窓（周期形）
-    let win: Vec<f32> = (0..n)
-        .map(|i| {
-            let x = std::f64::consts::TAU * i as f64 / n as f64;
-            (0.35875 - 0.48829 * x.cos() + 0.14128 * (2.0 * x).cos() - 0.01168 * (3.0 * x).cos()) as f32
-        })
-        .collect();
-    let win_sum: f64 = win.iter().map(|&w| w as f64).sum();
-    let scale = 2.0 / win_sum; // 正弦波の振幅 A → A
-
     let num_frames = samples.len() / hop + 1;
     let num_in_range = harmonics_in_range(sample_rate, f0);
 
-    let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(m);
-    let mut input = fft.make_input_vec();
-    let mut output = fft.make_output_vec();
-    let mut mag = vec![0f64; bins];
+    let mut reader = FrameSpectrum::new(n, hop);
+    let mut band_ratios = Vec::with_capacity(num_frames);
 
     let mut levels = Vec::with_capacity(num_frames * num_in_range);
     let mut hzs = Vec::with_capacity(num_frames * num_in_range);
@@ -257,25 +253,19 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
     let tol_bins = (SEARCH_TOLERANCE * f0 / bin_hz).max(1.0);
 
     for frame in 0..num_frames {
-        let center = (frame * hop) as isize;
-        let start = center - (n / 2) as isize;
-        input.iter_mut().for_each(|v| *v = 0.0);
-        for i in 0..n {
-            let s = start + i as isize;
-            if s >= 0 && (s as usize) < samples.len() {
-                input[i] = samples[s as usize] * win[i];
-            }
-        }
-        fft.process(&mut input, &mut output).map_err(|e| e.to_string())?;
-        for (b, c) in output.iter().enumerate() {
-            mag[b] = (c.re as f64).hypot(c.im as f64) * scale;
-        }
+        reader.compute(samples, frame)?;
+        let power = reader.windowed_power();
+        let mag = reader.magnitudes();
+        let mut harmonic_power = 0.0f64;
 
         // 倍音
         for k in 1..=num_in_range {
             let target = k as f64 * f0 / bin_hz;
-            let (amp, hz, detected) = estimate_peak(&mag, target, tol_bins, bin_hz);
+            let (amp, hz, detected) = estimate_peak(mag, target, tol_bins, bin_hz);
             let db = amp_to_db(amp);
+            if detected && db > FLOOR_DB {
+                harmonic_power += amp * amp / 2.0;
+            }
             levels.push(db);
             hzs.push(hz as f32);
             statuses.push(if db <= FLOOR_DB {
@@ -294,7 +284,11 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
             fsum += m * b as f64 * bin_hz;
             peak = peak.max(m);
         }
-        centroids.push((peak > FLOOR_AMP && wsum > 0.0).then(|| (fsum / wsum) as f32));
+        let audible = peak > FLOOR_AMP && wsum > 0.0;
+        centroids.push(audible.then(|| (fsum / wsum) as f32));
+
+        // 検出した倍音の正弦波パワーの和 ÷ フレームのパワー
+        band_ratios.push((audible && power > 0.0).then(|| (harmonic_power / power) as f32));
 
         // スペクトログラム（各セルは最大値で縮約）
         let col = frame / col_pool;
@@ -321,6 +315,7 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
         hz: hzs,
         status: statuses,
         centroid: centroids,
+        harmonic_ratio: band_ratios,
         spectrogram: Spectrogram {
             cols,
             rows,
@@ -331,12 +326,18 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
     })
 }
 
+/// target（ビン単位）の ±tol ビンで調べるビンの範囲 [lo, hi]（1〜bins−2 に制限）。空なら lo > hi
+fn search_bins(bins: usize, target: f64, tol: f64) -> (usize, usize) {
+    let lo = ((target - tol).floor().max(1.0)) as usize;
+    let hi = ((target + tol).ceil() as usize).min(bins - 2);
+    (lo, hi)
+}
+
 /// target（ビン単位、小数可）の ±tol ビンの範囲でピークを探し、振幅・周波数・局所ピークを検出したかを返す。
 /// 検出できなければ、target に最も近いビンの振幅とそのビンの周波数を返す。
 fn estimate_peak(mag: &[f64], target: f64, tol: f64, bin_hz: f64) -> (f64, f64, bool) {
     let last = mag.len() - 1;
-    let lo = ((target - tol).floor().max(1.0)) as usize;
-    let hi = ((target + tol).ceil() as usize).min(last - 1);
+    let (lo, hi) = search_bins(mag.len(), target, tol);
     let nearest = (target.round() as usize).clamp(1, last - 1);
     if lo > hi {
         return (mag[nearest], nearest as f64 * bin_hz, false);
@@ -352,14 +353,119 @@ fn estimate_peak(mag: &[f64], target: f64, tol: f64, bin_hz: f64) -> (f64, f64, 
         // 範囲内に極大が無い（隣の成分の裾など）→ 目標周波数に最も近いビンの値
         return (mag[nearest], nearest as f64 * bin_hz, false);
     }
-    // 対数振幅の放物線補間
-    // 下限より十分小さい値で切り、補正量はスカロッピング損失の上限（約 0.5 dB）までに抑える
+    let (amp, pos) = interpolate_peak(mag, best);
+    (amp, pos * bin_hz, true)
+}
+
+/// ビン b の極大を、対数振幅の 3 点放物線補間で求める（振幅, 位置［ビン、小数］）。
+/// 下限より十分小さい値で切り、補正量はスカロッピング損失の上限（約 0.5 dB）までに抑える
+fn interpolate_peak(mag: &[f64], b: usize) -> (f64, f64) {
     let l = |x: f64| x.max(FLOOR_AMP * 1e-3).ln();
-    let (a, b, c) = (l(mag[best - 1]), l(mag[best]), l(mag[best + 1]));
-    let denom = a - 2.0 * b + c;
+    let (a, m, c) = (l(mag[b - 1]), l(mag[b]), l(mag[b + 1]));
+    let denom = a - 2.0 * m + c;
     let p = if denom < -1e-12 { (0.5 * (a - c) / denom).clamp(-0.5, 0.5) } else { 0.0 };
-    let peak_ln = (b - 0.25 * (a - c) * p).min(b + 0.06);
-    (peak_ln.exp(), (best as f64 + p) * bin_hz, true)
+    let peak_ln = (m - 0.25 * (a - c) * p).min(m + 0.06);
+    (peak_ln.exp(), b as f64 + p)
+}
+
+/// 1 フレームのスペクトルの局所ピーク
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpectralPeak {
+    pub hz: f64,
+    /// 振幅（振幅 1.0 の正弦波 = 1.0）
+    pub amp: f64,
+}
+
+/// 縮約前の振幅スペクトルから局所ピーク（両隣より大きいビン。片側は同じ値も可）を拾い、放物線補間する。
+/// そのフレームの最大から `range_db` 以内、かつ下限（−120 dB）より大きいものだけを、振幅の大きい順に最大 `max_peaks` 個
+pub fn spectral_peaks(mag: &[f64], bin_hz: f64, range_db: f64, max_peaks: usize) -> Vec<SpectralPeak> {
+    if mag.len() < 3 {
+        return Vec::new();
+    }
+    let top = mag[1..].iter().cloned().fold(0.0, f64::max);
+    let min = (top * 10f64.powf(-range_db / 20.0)).max(FLOOR_AMP);
+    let mut peaks: Vec<SpectralPeak> = (1..mag.len() - 1)
+        .filter(|&b| mag[b] > min && mag[b] > mag[b - 1] && mag[b] >= mag[b + 1])
+        .map(|b| {
+            let (amp, pos) = interpolate_peak(mag, b);
+            SpectralPeak { hz: pos * bin_hz, amp }
+        })
+        .collect();
+    peaks.sort_by(|a, b| b.amp.total_cmp(&a.amp));
+    peaks.truncate(max_peaks);
+    peaks
+}
+
+/// 解析と同じ窓・ゼロ詰め・正規化で、1 フレームの振幅スペクトルを求める
+pub struct FrameSpectrum {
+    window: usize,
+    hop: usize,
+    win: Vec<f32>,
+    scale: f64,
+    /// Σ w²
+    win_sq: f64,
+    fft: std::sync::Arc<dyn realfft::RealToComplex<f32>>,
+    input: Vec<f32>,
+    output: Vec<realfft::num_complex::Complex<f32>>,
+    mag: Vec<f64>,
+}
+
+impl FrameSpectrum {
+    pub fn new(window: usize, hop: usize) -> Self {
+        let n = window;
+        // 4項 Blackman-Harris 窓（周期形）
+        let win: Vec<f32> = (0..n)
+            .map(|i| {
+                let x = std::f64::consts::TAU * i as f64 / n as f64;
+                (0.35875 - 0.48829 * x.cos() + 0.14128 * (2.0 * x).cos() - 0.01168 * (3.0 * x).cos()) as f32
+            })
+            .collect();
+        let win_sum: f64 = win.iter().map(|&w| w as f64).sum();
+        let win_sq: f64 = win.iter().map(|&w| (w as f64).powi(2)).sum();
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(n * 2); // 2 倍のゼロ詰め
+        let (input, output) = (fft.make_input_vec(), fft.make_output_vec());
+        let bins = output.len();
+        // 正弦波の振幅 A → A
+        Self { window, hop, win, scale: 2.0 / win_sum, win_sq, fft, input, output, mag: vec![0.0; bins] }
+    }
+
+    /// 解析結果と同じ条件のもの
+    pub fn for_analysis(a: &Analysis) -> Self {
+        Self::new(a.window, a.hop)
+    }
+
+    /// 直前に求めた振幅スペクトル（ビン 0〜fft_size/2）
+    pub fn magnitudes(&self) -> &[f64] {
+        &self.mag
+    }
+
+    /// 直前のフレームの、窓を掛けた信号の平均 2 乗 Σ(x·w)² / Σw²（DC 成分を除く）。
+    /// 振幅 A の定常な正弦波で A² / 2
+    pub fn windowed_power(&self) -> f64 {
+        let m = (self.mag.len() - 1) * 2; // FFT の長さ
+        let last = self.mag.len() - 1;
+        // Parseval: Σ(x·w)² = (1/m) Σ|X|²（両側）。|X| = mag / scale
+        let one_sided: f64 = self.mag[1..last].iter().map(|v| v * v).sum::<f64>() * 2.0 + self.mag[last].powi(2);
+        one_sided / (self.scale * self.scale) / m as f64 / self.win_sq
+    }
+
+    /// フレーム `frame` の振幅スペクトル（ビン 0〜fft_size/2）。窓が音声の外にかかる部分はゼロ
+    pub fn compute(&mut self, samples: &[f32], frame: usize) -> Result<&[f64], String> {
+        let n = self.window;
+        let start = (frame * self.hop) as isize - (n / 2) as isize;
+        self.input.iter_mut().for_each(|v| *v = 0.0);
+        for i in 0..n {
+            let s = start + i as isize;
+            if s >= 0 && (s as usize) < samples.len() {
+                self.input[i] = samples[s as usize] * self.win[i];
+            }
+        }
+        self.fft.process(&mut self.input, &mut self.output).map_err(|e| e.to_string())?;
+        for (m, c) in self.mag.iter_mut().zip(&self.output) {
+            *m = (c.re as f64).hypot(c.im as f64) * self.scale;
+        }
+        Ok(&self.mag)
+    }
 }
 
 #[cfg(test)]
