@@ -202,11 +202,25 @@ fn build<T: SizedSample + Copy + Send + 'static>(
     .map_err(|e| format!("入力ストリームを作れません: {e}"))
 }
 
-/// 取り込めるアプリの名前と、いま音を出しているか（macOS 以外では空）
-pub fn audio_app_names() -> Vec<(String, bool)> {
+/// 取り込めるアプリ
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppInfo {
+    /// 取り込み対象の名前（`Source::App` に渡す）
+    pub name: String,
+    /// いま音を出しているか
+    pub playing: bool,
+    /// ふつうのアプリ（`.app`）か。false はシステムの内部プロセスなど
+    pub bundled: bool,
+}
+
+/// 取り込めるアプリ（音を出している順。macOS 以外では空）
+pub fn audio_apps() -> Vec<AppInfo> {
     #[cfg(target_os = "macos")]
     {
-        crate::app_tap::list_audio_apps().into_iter().map(|a| (a.name, a.playing)).collect()
+        crate::app_tap::list_audio_apps()
+            .into_iter()
+            .map(|a| AppInfo { name: a.name, playing: a.playing, bundled: a.bundled })
+            .collect()
     }
     #[cfg(not(target_os = "macos"))]
     {
