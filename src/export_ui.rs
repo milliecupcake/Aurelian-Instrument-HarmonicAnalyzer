@@ -312,7 +312,7 @@ impl App {
                         .desired_width(300.0)
                         .text(format!("書き出し中… {:.0}%", job.progress.fraction() * 100.0)),
                 );
-                cancel = ui.button("キャンセル").clicked();
+                cancel = skin::button(ui, None, "キャンセル", skin::Active::No).clicked();
             });
             if cancel {
                 job.progress.cancel();
@@ -321,7 +321,11 @@ impl App {
             let range_err = self.export_range_error();
             let reason = self.export_block_reason().map(String::from).or(range_err);
             ui.horizontal(|ui| {
-                let r = ui.add_enabled(reason.is_none(), egui::Button::new(RichText::new("保存先を選んで書き出す…").strong()));
+                let r = ui
+                    .add_enabled_ui(reason.is_none(), |ui| {
+                        skin::button(ui, Some(skin::Icon::Export), "保存先を選んで書き出す…", skin::Active::No)
+                    })
+                    .inner;
                 if r.clicked() {
                     self.start_export();
                 }
