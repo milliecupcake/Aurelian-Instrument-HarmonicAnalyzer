@@ -6,12 +6,22 @@ use egui_plot::{
     Points, Span, Text, VLine,
 };
 use harmonic_analyzer::analysis::{Analysis, FLOOR_DB, HarmonicLevel, WindowSize, analyze, auto_window};
-use harmonic_analyzer::audio_file::{AudioClip, load_wav};
+use harmonic_analyzer::audio_file::{AudioClip, load_wav, write_wav_mono};
+use harmonic_analyzer::live::{LiveInput, input_device_names};
 use harmonic_analyzer::note::{nearest_note, parse_pitch};
 use harmonic_analyzer::filter::{self, Band, BandMode};
 use harmonic_analyzer::playback::Player;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// ライブ入力で保持・表示する長さ（秒）
+const LIVE_SECONDS: f64 = 5.0;
+/// ライブ入力の解析間隔
+const LIVE_INTERVAL: Duration = Duration::from_millis(70);
+
+type LiveResult = (Vec<f32>, u32, Result<Analysis, String>);
 
 const CURSOR_COLOR: Color32 = Color32::from_rgb(255, 160, 40);
 const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
@@ -114,6 +124,17 @@ struct App {
     /// 境界線をドラッグ中
     edge_drag: Option<BandEdge>,
 
+    /// ライブ入力（動作中のみ Some）
+    live: Option<LiveInput>,
+    live_devices: Vec<String>,
+    /// None = 既定の入力デバイス
+    live_device: Option<String>,
+    /// 最後に解析へ回した時点の受信サンプル数
+    live_seen: u64,
+    live_last: Instant,
+    /// 裏で走っている解析
+    live_job: Option<mpsc::Receiver<LiveResult>>,
+
     spec_texture: Option<egui::TextureHandle>,
     spec_dirty: bool,
     /// ファイルを開くたびに増やし、プロットの表示範囲をリセットする
@@ -146,6 +167,12 @@ impl Default for App {
             band_drag_start: None,
             edge_hover: None,
             edge_drag: None,
+            live: None,
+            live_devices: Vec::new(),
+            live_device: None,
+            live_seen: 0,
+            live_last: Instant::now(),
+            live_job: None,
             spec_texture: None,
             spec_dirty: true,
             generation: 0,
@@ -156,6 +183,7 @@ impl Default for App {
 
 impl App {
     fn open(&mut self, path: PathBuf) {
+        self.stop_live();
         match load_wav(&path) {
             Ok(clip) => {
                 self.player.set_clip(&clip.interleaved, clip.channels, clip.sample_rate);
@@ -172,6 +200,9 @@ impl App {
 
     /// フィルタ設定が変わっていて、マウスを離していれば、再生する音を作り直す
     fn sync_filter(&mut self, ctx: &egui::Context) {
+        if self.live.is_some() {
+            return;
+        }
         let Some(clip) = &self.clip else { return };
         let wanted = self.filter_on.then_some(self.band);
         if wanted == self.filter_applied || ctx.input(|i| i.pointer.any_down()) {
@@ -201,19 +232,95 @@ impl App {
             }
         };
         match analyze(&clip.mono, clip.sample_rate, f0, self.window) {
-            Ok(a) => {
-                self.bar_count = self.bar_count.clamp(1, 128);
-                self.selected.retain(|&k| a.is_in_range(k));
-                self.cursor = a.frame_time(a.frame_at(self.cursor));
-                self.analysis = Some(a);
-                self.error = None;
-                self.spec_dirty = true;
+            Ok(a) => self.set_analysis(a),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn set_analysis(&mut self, a: Analysis) {
+        self.bar_count = self.bar_count.clamp(1, 128);
+        self.selected.retain(|&k| a.is_in_range(k));
+        self.cursor = if self.live.is_some() {
+            // 窓がすべて実際の音に収まる、最も新しいフレーム
+            let dur = a.num_frames.saturating_sub(1) as f64 * a.hop as f64 / a.sample_rate as f64;
+            a.frame_time(a.frame_at(dur - a.window as f64 / 2.0 / a.sample_rate as f64))
+        } else {
+            a.frame_time(a.frame_at(self.cursor))
+        };
+        self.analysis = Some(a);
+        self.error = None;
+        self.spec_dirty = true;
+    }
+
+    fn start_live(&mut self) {
+        self.player.stop();
+        match LiveInput::open(self.live_device.as_deref(), LIVE_SECONDS) {
+            Ok(live) => {
+                let silent = vec![0.0; (LIVE_SECONDS * live.sample_rate as f64).round() as usize];
+                self.clip = Some(AudioClip::from_mono(silent, live.sample_rate));
+                self.path = None;
+                self.live = Some(live);
+                self.live_seen = 0;
+                self.live_job = None;
+                self.generation += 1;
+                self.reanalyze();
             }
             Err(e) => self.error = Some(e),
         }
     }
 
+    /// ライブ入力を止め、直近の音をふつうの録音として残す（再生・解析・保存ができる）
+    fn stop_live(&mut self) {
+        if self.live.take().is_none() {
+            return;
+        }
+        self.live_job = None;
+        if let Some(clip) = &self.clip {
+            self.player.set_clip(&clip.interleaved, clip.channels, clip.sample_rate);
+            self.filter_applied = None;
+        }
+    }
+
+    /// 解析結果を受け取り、間隔が空いていれば次の解析を裏で始める
+    fn poll_live(&mut self) {
+        if let Some(rx) = &self.live_job {
+            match rx.try_recv() {
+                Ok((samples, sr, res)) => {
+                    self.live_job = None;
+                    self.clip = Some(AudioClip::from_mono(samples, sr));
+                    match res {
+                        Ok(a) => self.set_analysis(a),
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => self.live_job = None,
+            }
+        }
+        let Some(live) = &self.live else { return };
+        if self.live_last.elapsed() < LIVE_INTERVAL {
+            return;
+        }
+        let (samples, total) = live.snapshot();
+        if total == self.live_seen {
+            return;
+        }
+        let Ok(f0) = self.resolved_f0() else { return };
+        let (sr, window) = (live.sample_rate, self.window);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res = analyze(&samples, sr, f0, window);
+            let _ = tx.send((samples, sr, res));
+        });
+        self.live_job = Some(rx);
+        self.live_seen = total;
+        self.live_last = Instant::now();
+    }
+
     fn set_cursor(&mut self, t: f64) {
+        if self.live.is_some() {
+            return; // ライブ中は常に最新の位置を見る
+        }
         if let Some(a) = &self.analysis {
             self.cursor = a.frame_time(a.frame_at(t));
         } else {
@@ -227,7 +334,7 @@ impl App {
     fn toggle_play(&mut self) {
         if self.player.is_playing() {
             self.player.stop();
-        } else if self.clip.is_some() {
+        } else if self.clip.is_some() && self.live.is_none() {
             self.player.play_from(self.cursor);
         }
     }
@@ -298,9 +405,10 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) && !ctx.egui_wants_keyboard_input() {
             self.toggle_play();
         }
-        if self.player.is_playing() {
+        if self.player.is_playing() || self.live.is_some() {
             ctx.request_repaint();
         }
+        self.poll_live();
         if self.spec_dirty {
             self.rebuild_spec_texture(&ctx);
         }
@@ -321,11 +429,15 @@ impl eframe::App for App {
                         self.filter_on = true;
                     }
                 }
+                if std::env::var("HA_LIVE").is_ok() {
+                    self.start_live();
+                }
                 if let Ok(list) = std::env::var("HA_SELECT") {
                     self.selected = list.split(',').filter_map(|v| v.trim().parse().ok()).collect();
                 }
             }
-            if self.frames == 15 {
+            // ライブ入力では音がたまるのを待つ（約2秒）
+            if self.frames == if self.live.is_some() { 120 } else { 15 } {
                 ctx.request_screenshot(move |img| {
                     save_png(&path, &img);
                     std::process::exit(0);
@@ -351,10 +463,15 @@ impl App {
             }
             let playing = self.player.is_playing();
             let label = if playing { "■ 停止" } else { "▶ 再生" };
-            if ui.add_enabled(self.clip.is_some(), egui::Button::new(label)).on_hover_text("Space").clicked() {
+            let can_play = self.clip.is_some() && self.live.is_none();
+            if ui.add_enabled(can_play, egui::Button::new(label)).on_hover_text("Space").clicked() {
                 self.toggle_play();
             }
-            if let (Some(p), Some(c)) = (&self.path, &self.clip) {
+            ui.separator();
+            self.live_controls(ui);
+            ui.separator();
+            if self.live.is_some() {
+            } else if let (Some(p), Some(c)) = (&self.path, &self.clip) {
                 ui.label(RichText::new(p.file_name().unwrap_or_default().to_string_lossy()).strong());
                 ui.label(format!(
                     "{} Hz / {} ch / {} / {:.3} 秒",
@@ -363,8 +480,19 @@ impl App {
                     c.format_desc,
                     c.duration()
                 ));
+            } else if let Some(c) = &self.clip {
+                ui.label(RichText::new("ライブ入力から取り込んだ音").strong());
+                ui.label(format!("{} Hz / {:.3} 秒", c.sample_rate, c.duration()));
+                if ui.button("WAV に保存…").clicked()
+                    && let Some(p) = rfd::FileDialog::new().add_filter("WAV", &["wav"]).set_file_name("live.wav").save_file()
+                {
+                    match write_wav_mono(&p, &c.mono, c.sample_rate) {
+                        Ok(()) => self.path = Some(p),
+                        Err(e) => self.error = Some(e),
+                    }
+                }
             } else {
-                ui.label("WAV ファイルを開くか、ウィンドウへドロップしてください");
+                ui.label("WAV ファイルを開くか、ウィンドウへドロップ、またはライブ入力を開始してください");
             }
             ui.separator();
             ui.label(RichText::new(format!("解析位置 {:.3} s", self.cursor)).color(CURSOR_COLOR));
@@ -451,8 +579,48 @@ impl App {
             }
         });
 
-        ui.horizontal(|ui| self.filter_controls(ui));
+        let live = self.live.is_some();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!live, |ui| self.filter_controls(ui));
+        });
         ui.add_space(4.0);
+    }
+
+    fn live_controls(&mut self, ui: &mut egui::Ui) {
+        if let Some(live) = &self.live {
+            if ui
+                .button(RichText::new("■ ライブ停止").color(Color32::from_rgb(255, 110, 110)))
+                .on_hover_text("止めた時点の直近の音が残り、再生・解析・保存できる")
+                .clicked()
+            {
+                self.stop_live();
+                return;
+            }
+            ui.label(RichText::new(format!("● {}  {} Hz", live.device_name, live.sample_rate)).color(Color32::from_rgb(255, 110, 110)));
+            let peak = live.peak();
+            let db = 20.0 * peak.max(1e-6).log10();
+            let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+            let color = if peak >= 0.99 { Color32::RED } else { Color32::from_rgb(80, 220, 120) };
+            ui.add(egui::ProgressBar::new(frac).desired_width(90.0).fill(color).text(format!("{db:.0} dBFS")))
+                .on_hover_text("入力レベル（直近のピーク）。赤は振り切れ");
+            if let Some(e) = live.error() {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            return;
+        }
+        if ui.button("● ライブ入力").on_hover_text("入力デバイスの音を、直近の数秒ずつリアルタイムに解析する").clicked() {
+            self.start_live();
+        }
+        let current = self.live_device.clone().unwrap_or_else(|| "既定の入力".into());
+        let r = egui::ComboBox::from_id_salt("live-device").selected_text(current).width(180.0).show_ui(ui, |ui| {
+            ui.selectable_value(&mut self.live_device, None, "既定の入力");
+            for name in &self.live_devices {
+                ui.selectable_value(&mut self.live_device, Some(name.clone()), name);
+            }
+        });
+        if r.response.clicked() {
+            self.live_devices = input_device_names();
+        }
     }
 
     fn filter_controls(&mut self, ui: &mut egui::Ui) {
@@ -679,7 +847,12 @@ impl App {
         };
 
         // 波形
-        ui.label(RichText::new("波形（クリックで解析位置・再生開始位置を指定、ドラッグ/ホイールで移動・拡大）").weak());
+        let hint = if self.live.is_some() {
+            "ライブ入力: 直近の音（右端が現在）。解析位置は常に最新。止めると自由に調べられる"
+        } else {
+            "波形（クリックで解析位置・再生開始位置を指定、ドラッグ/ホイールで移動・拡大）"
+        };
+        ui.label(RichText::new(hint).weak());
         let mono = &clip.mono;
         let sr = clip.sample_rate as f64;
         let r = time_plot("wave", total_h * 0.2)

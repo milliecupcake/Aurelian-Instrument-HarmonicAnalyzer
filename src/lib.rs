@@ -4,3 +4,4 @@ pub mod note;
 pub mod playback;
 pub mod test_tones;
 pub mod filter;
+pub mod live;
