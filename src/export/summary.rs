@@ -75,7 +75,7 @@ fn decay_text(d: features::Decay) -> String {
     }
 }
 
-pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> String {
+pub(super) fn build(snap: &Snapshot, feats: &features::Features, tr: &tracks::Tracks) -> String {
     let a = &snap.analysis;
     let c = &snap.clip;
     let sr = a.sample_rate as f64;
@@ -187,7 +187,12 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> String {
     let _ = writeln!(o, "  source.wav     試聴フィルタ適用前の音声（32-bit float、{} ch）", c.channels);
     let _ = writeln!(o, "  overview.png   波形・スペクトログラム・表示 ON の倍音の時間変化（フィルタ適用前の音）");
     let _ = writeln!(o, "  features.csv   倍音ごとの最大・持続区間の代表値・相対レベル・減衰時間");
-    let _ = writeln!(o, "  envelope.csv   フレームごとの RMS・ピーク・スペクトル重心");
+    let _ = writeln!(o, "  envelope.csv   フレームごとの RMS・ピーク・スペクトル重心・倍音のパワーの割合");
+    let _ = writeln!(o, "  pitch_track.csv 約 10 ms ごとの基音推定（参考値。倍音の値には使っていない）");
+    let _ = writeln!(
+        o,
+        "  partials.csv   同じ時刻のスペクトルの局所ピーク。class = harmonic / inharmonic（整数倍の間）/ below_f0"
+    );
     let _ = writeln!(o, "  manifest.json  解析条件・列の定義・表示と試聴の状態");
     o.push('\n');
 
@@ -299,6 +304,110 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> String {
     let _ = writeln!(o, "  減衰は各倍音の最大の時刻からの秒数。「未到達」は観測の終わりまで下回らなかったもの（観測外は推測しない）");
     o.push('\n');
 
+    let ps = &tr.pitch.stats;
+    let total = tr.pitch.rows.len();
+    let _ = writeln!(o, "■ 基音の時間変化（pitch_track.csv、参考値）");
+    let _ = writeln!(
+        o,
+        "  倍音解析は固定基音 {:.4} Hz のまま。下の推定値は harmonics.csv・features.csv・partials.csv には使っていない",
+        a.f0
+    );
+    let _ = writeln!(
+        o,
+        "  {} 時刻（{:.1} ms おき）: 周期を検出 {}、周期がはっきりしない {}、音が小さい {}、端で推定しない {}",
+        total,
+        tr.step as f64 * a.hop as f64 / sr * 1000.0,
+        ps.voiced,
+        ps.unvoiced,
+        ps.quiet,
+        ps.edge
+    );
+    match (ps.median_hz, ps.cents_p05, ps.cents_median, ps.cents_p95, ps.max_abs_cents) {
+        (Some(hz), Some(lo), Some(mid), Some(hi), Some(mx)) => {
+            let _ = writeln!(
+                o,
+                "  検出した基音の中央値 {hz:.3} Hz。固定基音からのずれ: 中央値 {mid:+.1} cent、5〜95% 点 {lo:+.1}〜{hi:+.1} cent、最大 {mx:.1} cent"
+            );
+            if tr.pitch.deviates() {
+                let _ = writeln!(
+                    o,
+                    "  ※ 固定基音とのずれが大きい。高次の倍音ほど探索範囲から外れ、値が実際より小さく出ている可能性がある"
+                );
+                let _ = writeln!(
+                    o,
+                    "    ただし推定値が固定基音の整数倍・整数分の 1 に近いときは、オクターブの取り違えや、非整数倍の成分による低い共通周期のこともある"
+                );
+            }
+        }
+        _ => {
+            let _ = writeln!(o, "  周期を検出できた時刻が無い");
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  オクターブの取り違えは補正していない。窓（{:.1} ms）より速い変化は平均される",
+        crate::pitch::track_window(a.sample_rate) as f64 / sr * 1000.0
+    );
+    o.push('\n');
+
+    let pt = &tr.partials;
+    let _ = writeln!(o, "■ 倍音以外の成分（partials.csv）");
+    let _ = writeln!(
+        o,
+        "  {} フレームで、最大から {} dB 以内の局所ピークを最大 {} 個ずつ拾った（{} 行）",
+        pt.frames_examined,
+        tracks::PEAK_RANGE_DB,
+        tracks::MAX_PEAKS_PER_FRAME,
+        pt.rows.len()
+    );
+    let _ = writeln!(
+        o,
+        "  整数倍 × {:.4} Hz から ±{:.2} Hz 以内を harmonic、それ以外を inharmonic（基音より下は below_f0）とした",
+        a.f0, pt.half_width_hz
+    );
+    if pt.recurring.is_empty() {
+        let _ = writeln!(
+            o,
+            "  調べたフレームの {:.0}% 以上に繰り返し現れる非整数倍のピーク: なし",
+            tracks::RECURRING_MIN_SHARE * 100.0
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "  調べたフレームの {:.0}% 以上に繰り返し現れる非整数倍のピーク（強い順）:",
+            tracks::RECURRING_MIN_SHARE * 100.0
+        );
+        for r in &pt.recurring {
+            let _ = writeln!(
+                o,
+                "    {:>10.2} Hz（{:.2}〜{:.2}）  中央値 {:>8.2} dB  {} フレーム（{:.0}%）  第{}倍音 {:.2} Hz から {:+.2} Hz  {}",
+                r.median_hz,
+                r.min_hz,
+                r.max_hz,
+                r.median_db,
+                r.frames,
+                r.share * 100.0,
+                r.nearest,
+                a.harmonic_hz(r.nearest),
+                r.dev_hz,
+                r.class.as_str()
+            );
+        }
+    }
+    if let Some((first, last)) = feats.valid {
+        let mut ratios: Vec<f64> = (first..=last).filter_map(|f| a.harmonic_power_ratio(f)).collect();
+        ratios.sort_by(f64::total_cmp);
+        if let Some(m) = ratios.get(ratios.len() / 2) {
+            let _ = writeln!(
+                o,
+                "  検出した倍音のパワーの割合（envelope.csv の harmonic_power_ratio、中央値）: {m:.3}（倍音だけの定常音で約 1。雑音だけでも 0 にはならない）"
+            );
+        }
+    }
+    let _ =
+        writeln!(o, "  局所ピークは楽器由来とは限らない（雑音の山・隣の成分の裾）。音源の種類や原因は判断していない");
+    o.push('\n');
+
     match snap.cursor_frame() {
         Some(f) => {
             let _ = writeln!(
@@ -356,11 +465,21 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> String {
     o.push('\n');
 
     let _ = writeln!(o, "■ 解釈するときの制約");
-    let _ = writeln!(o, "  ・基音は録音全体で固定。ピッチの揺れは追っていない");
+    let _ = writeln!(
+        o,
+        "  ・倍音解析の基音は録音全体で固定。時刻ごとの基音は pitch_track.csv に参考値として別に出しただけ"
+    );
     let _ = writeln!(o, "  ・全チャンネルの平均（モノラル）を解析。チャンネル間の差や逆相成分は数値に現れない");
     let _ = writeln!(o, "  ・値は周辺ピークの振幅で、帯域のエネルギーではない。位相は出力していない");
     let _ = writeln!(o, "  ・detected_peak でも楽器由来の倍音とは限らない。below_floor の真のレベルは不明");
-    let _ = writeln!(o, "  ・倍音以外の成分（非整数倍のピーク・雑音）は CSV に無い。スペクトログラム画像で確認する");
+    let _ = writeln!(
+        o,
+        "  ・非整数倍のピークは partials.csv にある（harmonics.csv には無い）。雑音は帯域のパワーの割合でしか表していない"
+    );
+    let _ = writeln!(
+        o,
+        "  ・位相とスペクトル全体は出力していない。倍音の振幅だけから元の波形や発音方式は一意に復元できない"
+    );
     let _ = writeln!(o, "  ・音源の種類や音の原因は、利用者の入力以外からは判断していない");
     o
 }

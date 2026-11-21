@@ -60,6 +60,8 @@ struct Unpacked {
     csv_bytes: Vec<u8>,
     features: Vec<csv::StringRecord>,
     envelope: Vec<csv::StringRecord>,
+    pitch: Vec<csv::StringRecord>,
+    partials: Vec<csv::StringRecord>,
     wav: Vec<u8>,
     png: Vec<u8>,
     summary: String,
@@ -83,6 +85,8 @@ fn unpack(path: &Path) -> Unpacked {
     };
     let features = records(read(FILE_FEATURES));
     let envelope = records(read(FILE_ENVELOPE));
+    let pitch = records(read(FILE_PITCH));
+    let partials = records(read(FILE_PARTIALS));
     let mut rdr = csv::Reader::from_reader(csv_bytes.as_slice());
     let header = rdr.headers().unwrap().iter().map(String::from).collect();
     let csv = rdr.records().map(|r| r.unwrap()).collect();
@@ -94,6 +98,8 @@ fn unpack(path: &Path) -> Unpacked {
         csv_bytes,
         features,
         envelope,
+        pitch,
+        partials,
         wav,
         png,
         summary,
@@ -435,7 +441,7 @@ fn feature_and_envelope_files_have_expected_shape() {
         assert_eq!(r[0].parse::<usize>().unwrap(), i);
         assert_eq!(f(r, 1).unwrap(), a.frame_time(i));
     }
-    assert_eq!(u.manifest["schema_version"], "1.1.0");
+    assert_eq!(u.manifest["schema_version"], SCHEMA_VERSION);
     assert_eq!(u.manifest["features"]["sustain_interval"]["specified"], false);
     assert!(all_numbers_finite(&u.manifest));
 }
@@ -581,4 +587,203 @@ fn invalid_ranges_are_rejected_before_export() {
     assert!(sample_range(f64::NAN, 0.5, SR, n).is_err());
     assert_eq!(sample_range(0.0, 2.0, SR, n).unwrap(), (0, n));
     assert_eq!(sample_range(0.5, 1.0, SR, n).unwrap(), (24_000, 48_000));
+}
+
+// ---- AIEXP-10: 基音の時間変化と倍音以外の成分 ----
+
+/// 0〜1 s: 200 → 300 Hz のグライド（倍音つき）、1〜1.4 s: 無音、1.4〜1.8 s: 雑音、1.8〜3 s: 250 Hz ± 40 cent のビブラート
+fn pitch_change_tone() -> (Vec<f32>, impl Fn(f64) -> Option<f64>) {
+    use std::f64::consts::TAU;
+    let sr = SR as f64;
+    let hz_at = |t: f64| -> Option<f64> {
+        if t < 1.0 {
+            Some(200.0 * 1.5f64.powf(t))
+        } else if t >= 1.8 {
+            Some(250.0 * 2f64.powf(40.0 / 1200.0 * (TAU * 5.5 * (t - 1.8)).sin()))
+        } else {
+            None
+        }
+    };
+    let mut phase = 0.0;
+    let mut seed = 2463534242u32;
+    let x = (0..3 * SR as usize)
+        .map(|i| {
+            let t = i as f64 / sr;
+            match hz_at(t) {
+                Some(hz) => {
+                    phase += TAU * hz / sr;
+                    (0.4 * phase.sin() + 0.2 * (2.0 * phase).sin() + 0.1 * (3.0 * phase).sin()) as f32
+                }
+                None if t >= 1.4 => {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed as f32 / u32::MAX as f32 - 0.5) * 0.6
+                }
+                None => 0.0,
+            }
+        })
+        .collect();
+    (x, hz_at)
+}
+
+#[test]
+fn pitch_track_distinguishes_change_from_unestimable_sections() {
+    let dir = tmp_dir("pitchtrack");
+    let (x, hz_at) = pitch_change_tone();
+    let snap = mono_snapshot(x, 250.0);
+    let u = export(&snap, &dir, "p.zip");
+    let a = &snap.analysis;
+    let m = &u.manifest["pitch_track"];
+    let step = m["frame_step"].as_u64().unwrap() as usize;
+    assert_eq!(u.pitch.len(), m["num_rows"].as_u64().unwrap() as usize);
+    assert_eq!(u.pitch.len(), (a.num_frames - 1) / step + 1);
+    assert!(u.pitch.iter().all(|r| r.len() == tracks::PITCH_COLUMNS.len()));
+    let half = crate::pitch::track_window(SR) as f64 / 2.0 / SR as f64 + 0.005;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut voiced_ok = 0;
+    for (i, r) in u.pitch.iter().enumerate() {
+        let frame: usize = r[0].parse().unwrap();
+        assert_eq!(frame, i * step);
+        let t = f(r, 1).unwrap();
+        assert_eq!(t, a.frame_time(frame), "harmonics.csv と同じ時刻");
+        let status = &r[2];
+        seen.insert(status.to_string());
+        // f0 と cent は voiced のときだけ
+        assert_eq!(f(r, 3).is_some(), status == "voiced");
+        assert_eq!(f(r, 4).is_some(), status == "voiced");
+        if let (Some(hz), Some(c)) = (f(r, 3), f(r, 4)) {
+            assert!((c - 1200.0 * (hz / 250.0).log2()).abs() < 1e-6);
+        }
+        let near = |b: f64| (t - b).abs() <= half;
+        if near(0.0) || near(3.0) || near(1.0) || near(1.4) || near(1.8) {
+            continue;
+        }
+        match hz_at(t) {
+            Some(hz) => {
+                assert_eq!(status, "voiced", "{t} s");
+                let cents = 1200.0 * (f(r, 3).unwrap() / hz).log2();
+                assert!(cents.abs() < 15.0, "{t} s: {:?} のはずが {hz}", f(r, 3));
+                voiced_ok += 1;
+            }
+            None if t < 1.4 => assert_eq!(status, "quiet", "{t} s"),
+            None => assert_eq!(status, "unvoiced", "{t} s"),
+        }
+    }
+    assert!(voiced_ok > 150);
+    for s in ["voiced", "unvoiced", "quiet", "edge"] {
+        assert!(seen.contains(s), "{s} が無い");
+    }
+    // グライドの幅（200 → 300 Hz）は固定基音 250 Hz から大きくずれる
+    assert_eq!(m["voiced_stats"]["deviates_from_analysis_f0"], true);
+    assert!(u.summary.contains("固定基音とのずれが大きい"));
+    // 倍音解析は固定基音のまま
+    assert_eq!(u.manifest["pitch"]["f0_mode"], "fixed");
+    assert_eq!(u.manifest["pitch"]["analysis_f0_hz"], 250.0);
+    assert!(u.csv.iter().all(|r| f(r, 3).unwrap() == r[2].parse::<f64>().unwrap() * 250.0));
+    assert!(all_numbers_finite(&u.manifest));
+}
+
+#[test]
+fn steady_tone_does_not_deviate() {
+    let dir = tmp_dir("steady");
+    let snap = mono_snapshot(test_tones::sine_220_plus_half_440(), 220.0);
+    let u = export(&snap, &dir, "s.zip");
+    let v = &u.manifest["pitch_track"]["voiced_stats"];
+    assert!((v["median_f0_hz"].as_f64().unwrap() - 220.0).abs() < 0.2);
+    assert!(v["cents_from_analysis_f0"]["max_abs"].as_f64().unwrap() < 3.0);
+    assert_eq!(v["deviates_from_analysis_f0"], false);
+    assert!(!u.summary.contains("固定基音とのずれが大きい"));
+    // 整数倍だけの音には、繰り返し現れる非整数倍のピークが無い
+    assert_eq!(u.manifest["partials"]["recurring_non_harmonic"]["items"], serde_json::json!([]));
+    let inh = u.partials.iter().filter(|r| &r[10] != "harmonic" && f(r, 5).unwrap() > -60.0).count();
+    assert_eq!(inh, 0, "強い非整数倍のピークは無いはず");
+}
+
+#[test]
+fn inharmonic_750_is_recorded_apart_from_integer_harmonics() {
+    let dir = tmp_dir("inh750");
+    // 試験音のファイル（test_tones/4_inharmonic_750.wav と同じ内容）
+    let snap = mono_snapshot(test_tones::inharmonic_750(), 220.0);
+    let u = export(&snap, &dir, "i.zip");
+    let a = &snap.analysis;
+    assert!(u.partials.iter().all(|r| r.len() == tracks::PARTIAL_COLUMNS.len()));
+    let pm = &u.manifest["partials"];
+    assert_eq!(u.partials.len(), pm["num_rows"].as_u64().unwrap() as usize);
+    let examined = pm["frames_examined"].as_u64().unwrap() as usize;
+    assert!(examined > 100);
+
+    // 各フレームで、750 Hz のピークが inharmonic（第3倍音 660 Hz から +90 Hz）として出る
+    let mut frames_750 = std::collections::BTreeSet::new();
+    for r in &u.partials {
+        let frame: usize = r[0].parse().unwrap();
+        assert!(!a.is_edge_padded(frame));
+        let hz = f(r, 3).unwrap();
+        if (hz - 750.0).abs() < 1.0 {
+            assert_eq!(&r[10], "inharmonic");
+            assert_eq!(&r[6], "3");
+            assert!((f(r, 8).unwrap() - 90.0).abs() < 1.0);
+            assert!((f(r, 4).unwrap() - 20.0 * 0.25f64.log10()).abs() < 0.2, "750 Hz は振幅 0.25");
+            frames_750.insert(frame);
+        }
+        if (hz - 220.0).abs() < 1.0 {
+            assert_eq!(&r[10], "harmonic");
+            assert_eq!(&r[6], "1");
+        }
+    }
+    assert_eq!(frames_750.len(), examined, "全フレームで 750 Hz を記録");
+
+    // 繰り返し現れる非整数倍のピークとしてまとまる
+    let items = pm["recurring_non_harmonic"]["items"].as_array().unwrap();
+    let top = &items[0];
+    assert!((top["median_hz"].as_f64().unwrap() - 750.0).abs() < 0.5, "{top}");
+    assert_eq!(top["class"], "inharmonic");
+    assert_eq!(top["nearest_harmonic"], 3);
+    assert!(top["share_of_examined_frames"].as_f64().unwrap() > 0.99);
+    assert!(u.summary.contains("750."));
+
+    // harmonics.csv には 750 Hz のピークが入らない（整数倍の探索範囲の外）
+    assert!(u.csv.iter().all(|r| f(r, 4).is_none_or(|p| (p - 750.0).abs() > 30.0)));
+
+    // 検出した倍音のパワーの割合は 1 より小さい（750 Hz の分）
+    let (first, last) = summary::stats_frames(a).unwrap();
+    let r = a.harmonic_power_ratio((first + last) / 2).unwrap();
+    let expect = 0.5f64.powi(2) / (0.5f64.powi(2) + 0.25f64.powi(2));
+    assert!((r - expect).abs() < 0.01, "{r} vs {expect}");
+}
+
+#[test]
+fn harmonic_power_ratio_separates_tone_from_noise() {
+    for x in [test_tones::sine_220(), test_tones::sine_220_plus_half_440()] {
+        let a = analyze(&x, SR, 220.0, WindowSize::Auto).unwrap();
+        let r = a.harmonic_power_ratio(a.frame_at(1.0)).unwrap();
+        assert!((r - 1.0).abs() < 0.01, "{r}");
+    }
+    let mut seed = 88172645u32;
+    let noise: Vec<f32> = (0..SR as usize * 2)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32 - 0.5
+        })
+        .collect();
+    let n = analyze(&noise, SR, 220.0, WindowSize::Auto).unwrap();
+    let mut v: Vec<f64> = (10..n.num_frames - 10).filter_map(|f| n.harmonic_power_ratio(f)).collect();
+    v.sort_by(f64::total_cmp);
+    let med = v[v.len() / 2];
+    assert!(med < 0.5, "雑音 {med}");
+    let s = analyze(&vec![0.0; SR as usize], SR, 220.0, WindowSize::Auto).unwrap();
+    assert!((0..s.num_frames).all(|f| s.harmonic_power_ratio(f).is_none()));
+}
+
+#[test]
+fn classify_boundaries() {
+    use tracks::{PartialClass::*, classify};
+    assert_eq!(classify(220.0, 220.0, 22.0), (1, 0.0, Harmonic));
+    assert_eq!(classify(750.0, 220.0, 22.0).2, Inharmonic);
+    assert_eq!(classify(682.0, 220.0, 22.0).2, Harmonic);
+    assert_eq!(classify(683.0, 220.0, 22.0).2, Inharmonic);
+    assert_eq!(classify(100.0, 220.0, 22.0), (1, -120.0, BelowF0));
+    assert_eq!(classify(50.0, 220.0, 22.0).0, 1, "0 番は使わない");
 }

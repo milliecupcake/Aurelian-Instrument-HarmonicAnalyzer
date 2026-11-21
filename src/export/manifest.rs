@@ -28,7 +28,7 @@ fn range(r: Option<(f64, f64)>) -> Value {
     }
 }
 
-pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> Value {
+pub(super) fn build(snap: &Snapshot, feats: &features::Features, tr: &tracks::Tracks) -> Value {
     let a = &snap.analysis;
     let c = &snap.clip;
     let sr = a.sample_rate as f64;
@@ -216,12 +216,155 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> Value {
         { "name": "rms_db", "unit": "dB", "description": "解析と同じ中心・長さの矩形窓での RMS（解析用モノラル）。振幅 1.0 = 0 dB（振幅 1.0 の正弦波の RMS は −3.01 dB）。下限 −120 dB" },
         { "name": "peak_db", "unit": "dB", "description": "同じ窓での最大の絶対値（サンプルピーク）。振幅 1.0 = 0 dB。下限 −120 dB" },
         { "name": "spectral_centroid_hz", "unit": "Hz", "description": "縮約前の線形振幅スペクトル（窓掛け・2 倍ゼロ詰め、DC を除く全ビン）を振幅で重み付けした平均周波数。無音（全ビンが下限以下）は空欄。dB 値や縮約済みのセルは使わない" },
+        { "name": "harmonic_power_ratio", "unit": null, "description": "検出した倍音のパワーの割合 = Σ（その フレームで status が detected_peak の倍音の振幅² / 2）÷ フレームのパワー（窓を掛けた信号の平均 2 乗、DC を除く）。倍音だけの定常音でほぼ 1、非整数倍の成分・雑音・固定基音からのピッチのずれがあると小さくなる。無音は空欄" },
         { "name": "edge_padded", "unit": null, "description": "harmonics.csv と同じ" },
         { "name": "samples_used", "unit": "samples", "description": "RMS・ピークの計算に使ったサンプル数（端のフレームでは窓の一部が音声の外なので少ない。ゼロ埋めは数えない）" },
     ]);
 
     let spec = &a.spectrogram;
     let (ov_lo, ov_hi) = overview::freq_range(snap);
+
+    let step = tr.step;
+    let ps = &tr.pitch.stats;
+    let (tau_min, tau_max) = crate::pitch::period_range(a.sample_rate);
+    let track_len = crate::pitch::track_window(a.sample_rate);
+    let pitch_track = json!({
+        "file": FILE_PITCH,
+        "role": "時刻ごとの基音の参考値。harmonics.csv・features.csv・partials.csv の計算には使っていない",
+        "row": "1 行 = 1 時刻（解析フレームを frame_step おきに選んだもの）",
+        "frame_step": step,
+        "step_s": n(step as f64 * a.hop as f64 / sr),
+        "frame_index_note": "harmonics.csv の frame_index と同じ番号・同じ時刻",
+        "num_rows": tr.pitch.rows.len(),
+        "method": {
+            "name": "YIN（差分関数を FFT で計算）",
+            "input": "解析と同じモノラル音声。フィルタ・正規化はしない",
+            "window_samples": track_len,
+            "window_s": n(track_len as f64 / sr),
+            "window_rule": "最長の周期の 2 倍 + 2 サンプルの矩形窓。周期 τ の比較に使う w + τ サンプルの中心がその時刻に来るよう、1 回目の推定の周期で窓をずらして求め直す",
+            "search_range_hz": [n(crate::pitch::MIN_HZ), n(crate::pitch::max_hz(a.sample_rate))],
+            "period_range_samples": [tau_min, tau_max],
+            "threshold": crate::pitch::TRACK_THRESHOLD,
+            "dip_rule": "累積平均で正規化した差分 d'(τ) が threshold を下回る最初の谷（下回らなければ最小の谷）を放物線補間する",
+            "quiet_rule": format!("窓の RMS が全時刻の最大から {} dB より小さい、または −100 dB 未満なら推定しない", crate::pitch::TRACK_QUIET_DB),
+            "independent_of_analysis_f0": "推定は analysis_f0_hz を使わない（cents_from_analysis_f0 の計算にだけ使う）",
+        },
+        "status_values": {
+            "voiced": "周期を検出した（aperiodicity < threshold）。f0_hz に値がある",
+            "unvoiced": "音はあるが周期がはっきりしない（雑音・複数の音・急な変化・非整数倍の成分など）。f0_hz は空欄",
+            "quiet": "音が小さすぎるので推定しない。f0_hz・aperiodicity は空欄",
+            "edge": "推定の窓が音声の端をはみ出すので推定しない（窓の長さの半分より端に近い時刻）",
+        },
+        "columns": [
+            { "name": "frame_index", "unit": null, "description": "解析フレームの番号（harmonics.csv と同じ）" },
+            { "name": "time_s", "unit": "s", "description": "時刻（harmonics.csv と同じ。推定の窓の中心）" },
+            { "name": "status", "unit": null, "description": "voiced / unvoiced / quiet / edge" },
+            { "name": "f0_hz", "unit": "Hz", "description": "推定した基音。voiced のときだけ" },
+            { "name": "cents_from_analysis_f0", "unit": "cent", "description": "1200 × log2(f0_hz / analysis_f0_hz)。voiced のときだけ" },
+            { "name": "aperiodicity", "unit": null, "description": "選んだ谷の d'（0 に近いほど周期的）。voiced・unvoiced のとき" },
+            { "name": "rms_db", "unit": "dB", "description": "推定の窓（window_samples の矩形窓）の RMS。振幅 1.0 = 0 dB。edge は空欄。envelope.csv の rms_db とは窓が違う" },
+        ],
+        "counts": { "voiced": ps.voiced, "unvoiced": ps.unvoiced, "quiet": ps.quiet, "edge": ps.edge },
+        "voiced_stats": {
+            "median_f0_hz": ps.median_hz.map(n),
+            "cents_from_analysis_f0": {
+                "p05": ps.cents_p05.map(n),
+                "median": ps.cents_median.map(n),
+                "p95": ps.cents_p95.map(n),
+                "max_abs": ps.max_abs_cents.map(n),
+            },
+            "deviates_from_analysis_f0": tr.pitch.deviates(),
+            "deviates_rule": "中央値が ±50 cent を超える、または 5〜95% の幅が 50 cent を超える。true なら固定基音による倍音の値（とくに高次）が外れている可能性がある",
+        },
+        "limitations": [
+            "オクターブの取り違え（倍・半分）が起こりうる。前後の時刻とのつながりは補正していない",
+            "窓（window_s）より速い変化は平均される",
+            "非整数倍の成分を含む音では、両方の公約数に近い低い周期を返すことがある",
+            "voiced は周期的という意味で、聴感上の音高や楽器の基音と一致する保証はない",
+        ],
+    });
+
+    let pt = &tr.partials;
+    let recurring: Vec<Value> = pt
+        .recurring
+        .iter()
+        .map(|r| {
+            json!({
+                "median_hz": n(r.median_hz),
+                "range_hz": [n(r.min_hz), n(r.max_hz)],
+                "median_level_db": n(r.median_db),
+                "frames": r.frames,
+                "share_of_examined_frames": n(r.share),
+                "nearest_harmonic": r.nearest,
+                "deviation_hz": n(r.dev_hz),
+                "class": r.class.as_str(),
+            })
+        })
+        .collect();
+    let partials = json!({
+        "file": FILE_PARTIALS,
+        "role": "縮約前のスペクトルの局所ピーク。harmonics.csv に入らない非整数倍の成分・基音より低い成分も含む",
+        "row": "1 行 = 1 フレームの 1 ピーク",
+        "order": "frame_index の昇順、同じフレームの中は rank（振幅の大きい順）",
+        "frames": format!("pitch_track.csv と同じ時刻のうち、edge_padded でないフレーム（{} 個）", pt.frames_examined),
+        "frames_examined": pt.frames_examined,
+        "num_rows": pt.rows.len(),
+        "spectrum": {
+            "same_as": "harmonics.csv と同じ窓・ゼロ詰め・振幅の正規化（analysis.window・analysis.amplitude）",
+            "value": "線形振幅（振幅 1.0 の正弦波 = 1.0）を 20 × log10 で dB にしたもの。パワーやエネルギーではない",
+            "frequency_axis": "FFT ビン（bin_hz 間隔）を対数振幅の放物線補間で求めた周波数",
+            "reduction": "なし（縮約前のスペクトル。スペクトログラム画像のセルは使わない）",
+        },
+        "peak_rule": {
+            "local_max": "左隣より大きく、右隣以上のビン",
+            "range_db": n(tracks::PEAK_RANGE_DB),
+            "range_rule": "そのフレームの最大ピークから range_db 以内、かつ floor_db より大きいもの",
+            "max_peaks_per_frame": tracks::MAX_PEAKS_PER_FRAME,
+            "selection": "条件に合うピークのうち振幅の大きい順に max_peaks_per_frame 個まで",
+        },
+        "classification": {
+            "reference_f0": "analysis_f0_hz（固定。pitch_track.csv の値は使わない）",
+            "nearest_harmonic": "max(1, round(peak_hz / analysis_f0_hz))",
+            "harmonic_tolerance_hz": n(pt.half_width_hz),
+            "harmonic_tolerance_rule": "倍音のピーク探索と同じ幅（peak_search.half_width_hz）",
+            "values": {
+                "harmonic": "|peak_hz − nearest_harmonic × analysis_f0_hz| ≤ harmonic_tolerance_hz",
+                "inharmonic": "整数倍から harmonic_tolerance_hz より離れている（整数倍の間）",
+                "below_f0": "peak_hz < analysis_f0_hz − harmonic_tolerance_hz",
+            },
+            "nyquist": "nearest_harmonic が解析範囲（num_in_range）を超えることがある（ナイキスト近くのピーク）",
+        },
+        "columns": [
+            { "name": "frame_index", "unit": null, "description": "解析フレームの番号（harmonics.csv と同じ）" },
+            { "name": "time_s", "unit": "s", "description": "窓の中心の時刻" },
+            { "name": "rank", "unit": null, "description": "そのフレームでの振幅の順位（1 = 最大）" },
+            { "name": "peak_hz", "unit": "Hz", "description": "ピークの周波数（放物線補間）" },
+            { "name": "level_db", "unit": "dB", "description": "ピークの振幅レベル（振幅 1.0 の正弦波 = 0 dB）" },
+            { "name": "rel_frame_max_db", "unit": "dB", "description": "そのフレームの最大ピーク（rank 1）に対する差（0 以下）" },
+            { "name": "nearest_harmonic", "unit": null, "description": "最も近い整数倍の番号" },
+            { "name": "nearest_harmonic_hz", "unit": "Hz", "description": "nearest_harmonic × analysis_f0_hz" },
+            { "name": "deviation_hz", "unit": "Hz", "description": "peak_hz − nearest_harmonic_hz" },
+            { "name": "deviation_cents", "unit": "cent", "description": "1200 × log2(peak_hz / nearest_harmonic_hz)" },
+            { "name": "class", "unit": null, "description": "harmonic / inharmonic / below_f0" },
+        ],
+        "recurring_non_harmonic": {
+            "description": "class が inharmonic・below_f0 のピークのうち、多くのフレームに繰り返し現れる周波数",
+            "rule": format!(
+                "周波数を {:.4} Hz（2 ビン）の升に分け、前後 1 升を合わせて、調べたフレームの {:.0}% 以上に現れる升を多い順に選ぶ（近い升は 1 つにまとめる。最大 {} 個）。値は同じフレームでいちばん強いピークのもの",
+                pt.cluster_hz,
+                tracks::RECURRING_MIN_SHARE * 100.0,
+                tracks::RECURRING_MAX
+            ),
+            "order": "median_level_db の大きい順",
+            "items": recurring,
+        },
+        "limitations": [
+            "局所ピークは楽器由来の成分とは限らない（雑音の山・窓のサイドローブ・隣の成分の裾）。雑音が多いと max_peaks_per_frame 個まで雑音の山で埋まる",
+            "harmonic は固定基音の整数倍に近いという意味で、ピッチが動く音では本来の倍音でも inharmonic になりうる（pitch_track.csv を併せて見る）",
+            "周波数分解能は窓長で決まる。main lobe（約 ±4 ビン）より近い 2 つの成分は 1 つのピークになる",
+            "harmonic_tolerance_hz が analysis_f0_hz の 1/2 に近いと、ほとんどのピークが harmonic になる",
+        ],
+    });
 
     json!({
         "schema": "harmonic_analyzer.ai_export",
@@ -242,7 +385,9 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> Value {
             { "name": FILE_SUMMARY, "role": "主要な数値の要約、解析上の制約、利用者の入力した背景と質問（日本語）" },
             { "name": FILE_CSV, "role": "解析範囲内の全倍音 × 全フレームの数値（基音に対する相対レベルつき）" },
             { "name": FILE_FEATURES, "role": "倍音ごとの特徴量（最大・持続区間の代表値・相対レベル・減衰時間）" },
-            { "name": FILE_ENVELOPE, "role": "フレームごとの RMS・ピーク・スペクトル重心" },
+            { "name": FILE_ENVELOPE, "role": "フレームごとの RMS・ピーク・スペクトル重心・倍音帯域のパワーの割合" },
+            { "name": FILE_PITCH, "role": "約 10 ms ごとの基音推定（参考値。倍音解析には使っていない）と推定できたかどうか" },
+            { "name": FILE_PARTIALS, "role": "スペクトルの局所ピーク（非整数倍の成分を含む）と、固定基音の整数倍との関係" },
             { "name": FILE_WAV, "role": "試聴フィルタ適用前の音声" },
             { "name": FILE_OVERVIEW, "role": "波形・スペクトログラム・表示 ON の倍音の時間変化をまとめた画像" },
         ],
@@ -265,6 +410,8 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> Value {
         "pitch": {
             "analysis_f0_hz": n(a.f0),
             "analysis_f0_note": "倍音解析に実際に使った基音。録音全体で 1 つの固定値",
+            "f0_mode": "fixed",
+            "f0_mode_note": "harmonics.csv・features.csv・partials.csv の分類はすべてこの固定基音による。時間変化する基音は pitch_track.csv に別に出すだけで、倍音解析には使わない（方式を混在させない）",
             "input": if snap.pitch.matches_analysis {
                 json!({
                     "text": snap.pitch.text,
@@ -400,7 +547,19 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> Value {
             "row": "1 行 = 1 フレーム（harmonics.csv と同じフレーム）",
             "window": "解析と同じ中心・長さ（window.length_samples）の矩形窓",
             "target": "解析用モノラル（全チャンネルの算術平均）",
+            "harmonic_power_ratio_limits": [
+                "雑音だけでも、各倍音の探索範囲で雑音の山を detected_peak として拾うので 0 にはならない（倍音の数が多いほど大きい）",
+                "雑音や非整数倍の成分が倍音の探索範囲に入ると、倍音のパワーに数えられる",
+                "振幅の補間と音の変化のため、1 をわずかに超えることがある",
+                "雑音の種類（スペクトルの形）は評価しない",
+            ],
             "columns": envelope_columns,
+        },
+        "pitch_track": pitch_track,
+        "partials": partials,
+        "not_exported": {
+            "full_spectrum": "スペクトル全体（全ビン × 全フレーム）は出力しない。ピークは partials.csv、全体の様子は overview.png のスペクトログラム（縮約済み）",
+            "phase": "位相は出力しない。倍音の振幅（と周波数）だけから元の波形や発音方式（FM の設定など）を一意に復元することはできない。再合成を目的にするなら、位相の保存を別に設計する必要がある",
         },
         "user_notes": {
             "instrument_or_source": text_or_null(&snap.notes.instrument),
@@ -409,13 +568,14 @@ pub(super) fn build(snap: &Snapshot, feats: &features::Features) -> Value {
             "note": "利用者の任意入力。null は未入力（不明）",
         },
         "limitations": [
-            "倍音解析は録音全体で 1 つの固定基音を使う。ピッチの揺れ（ビブラートなど）は追わない",
+            "倍音解析は録音全体で 1 つの固定基音を使う。ピッチの揺れ（ビブラートなど）は倍音の値に反映しない。時刻ごとの基音は pitch_track.csv に参考値として別に出す",
             "解析は全チャンネルの平均（モノラル）に対して行う。チャンネル間の差や逆相成分は解析値に現れない",
             "各倍音の値は周辺ピークの振幅で、帯域のエネルギーではない。位相は出力しない",
             "detected_peak は楽器由来の倍音であることを保証しない",
             "floor_db 以下の値は真のレベルが分からない",
             "edge_padded のフレームは窓の一部がゼロなので値が小さく出やすい",
-            "倍音以外の成分（非整数倍のピーク・雑音）は harmonics.csv に含まれない。スペクトログラム画像で確認する",
+            "倍音以外の成分（非整数倍のピーク）は harmonics.csv に含まれない。partials.csv と envelope.csv の harmonic_power_ratio を見る",
+            "雑音の量は harmonic_power_ratio とピークの数でしか表していない。雑音の種類やスペクトルの形は評価していない",
         ],
     })
 }
