@@ -11,6 +11,7 @@ use harmonic_analyzer::filter::{self, Band, BandMode};
 use harmonic_analyzer::harmonics::{BAR_HALF_WIDTH, DEFAULT_ON, RangeOp, Shown, harmonics_in_span};
 use harmonic_analyzer::live::{AppInfo, LiveInput, Source, audio_apps, input_device_names};
 use harmonic_analyzer::note::{nearest_note, parse_pitch};
+use harmonic_analyzer::pitch::{Estimate, estimate_f0};
 use harmonic_analyzer::playback::Player;
 use harmonic_analyzer::test_tones;
 use std::path::PathBuf;
@@ -232,6 +233,8 @@ struct App {
     error: Option<String>,
 
     f0_text: String,
+    /// 直前に「推定」した結果（基音を手で変えたら消す）
+    f0_estimate: Option<Estimate>,
     a4_hz: f64,
     cents: f64,
     window: WindowSize,
@@ -302,6 +305,7 @@ impl Default for App {
             analysis: None,
             error: None,
             f0_text: "A3".into(),
+            f0_estimate: None,
             a4_hz: 440.0,
             cents: 0.0,
             window: WindowSize::Auto,
@@ -370,6 +374,7 @@ impl App {
         self.path = None;
         self.sample = None;
         self.pick = None;
+        self.f0_estimate = None;
         self.generation += 1;
         self.reanalyze();
     }
@@ -390,6 +395,26 @@ impl App {
         };
         self.player.replace_audio(data, clip.channels, clip.sample_rate);
         self.filter_applied = wanted;
+    }
+
+    /// 取り込んだ音から基音を推定して設定する。設定したら true（解析し直す）
+    fn estimate_pitch(&mut self) -> bool {
+        let Some(clip) = &self.clip else { return false };
+        match estimate_f0(&clip.mono, clip.sample_rate) {
+            Some(e) => {
+                // 音名 + 補正で表すと、A4 の基準を変えても音名の関係が保たれる
+                let (name, dev) = nearest_note(e.hz, self.a4_hz);
+                self.f0_text = name;
+                self.cents = (dev * 10.0).round() / 10.0;
+                self.f0_estimate = Some(e);
+                true
+            }
+            None => {
+                self.f0_estimate = None;
+                self.error = Some("基音を推定できませんでした（無音か、音程のはっきりしない音です）".into());
+                false
+            }
+        }
     }
 
     /// 基音の指定（音名/Hz + チューニング補正）から実際に使う周波数
@@ -707,6 +732,9 @@ impl App {
                 self.source_tab = SourceTab::App;
             }
         }
+        if var("HA_ESTIMATE").is_some() && self.estimate_pitch() {
+            self.reanalyze();
+        }
         if let Some(k) = var("HA_FOCUS").and_then(|v| v.parse().ok()) {
             self.focused = Some(k);
         }
@@ -859,10 +887,20 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("基音").strong());
                 let r = ui.add(egui::TextEdit::singleline(&mut self.f0_text).desired_width(70.0).hint_text("A3 / 220"));
+                if r.changed() {
+                    self.f0_estimate = None;
+                }
                 if r.lost_focus() || (r.changed() && parse_pitch(&self.f0_text, self.a4_hz).is_ok()) {
                     changed = true;
                 }
                 r.on_hover_text("音名（A3, C#4, Bb2）または周波数（220, 220 Hz）");
+                if ui
+                    .button("推定")
+                    .on_hover_text("取り込んだ音から基音を推定し、最も近い音名と補正（cent）に設定する")
+                    .clicked()
+                {
+                    changed |= self.estimate_pitch();
+                }
                 ui.label("A4 =");
                 changed |= ui
                     .add(egui::DragValue::new(&mut self.a4_hz).range(400.0..=480.0).speed(0.1).suffix(" Hz"))
@@ -878,6 +916,14 @@ impl App {
                 }
                 match self.resolved_f0() {
                     Ok(f0) => {
+                        if let Some(e) = self.f0_estimate {
+                            let sure = if e.confidence >= 0.8 { "高" } else if e.confidence >= 0.5 { "中" } else { "低" };
+                            ui.label(hint(ui, format!("推定 {:.2} Hz（確からしさ {sure}）", e.hz))).on_hover_text(format!(
+                                "音のある区間のうち {:.0}% で同じ周期が見つかった。\n\
+                                 鐘のように倍音が整数倍でない音では、低めの値（共通の周期）が出ることがある。そのときは手で直す",
+                                e.confidence * 100.0
+                            ));
+                        }
                         let (name, dev) = nearest_note(f0, self.a4_hz);
                         ui.label(RichText::new(format!("使用 {f0:.2} Hz")).strong())
                             .on_hover_text("実際に解析に使う基音の周波数");
