@@ -13,11 +13,14 @@ cargo test --release                            # 完成確認の音例を自動
 アプリの音を取り込むときは `.app` として起動する。macOS は「システムオーディオ録音」の許可を、Info.plist に用途の説明を持つアプリにしか求めないため、`cargo run` で直接起動するとエラーにならずに無音だけが届く（画面に「無音のまま」と出る）。
 
 ```bash
-./scripts/bundle_macos.sh                  # target/release/HarmonicAnalyzer.app を作る（アドホック署名つき）
-open target/release/HarmonicAnalyzer.app   # 初回に「システムオーディオ録音」の許可を求められる
+./scripts/bundle_macos.sh --install   # .app を作って /Applications に置く（書き込めなければ ~/Applications）
 ```
 
+置いた後は Finder・Launchpad・Spotlight から「HarmonicAnalyzer」で開ける。初回に「システムオーディオ録音」の許可を求められる。新しい版を入れるときは、アプリを終了してから同じコマンドをもう一度実行する（起動中なら止まって知らせる）。署名はアドホックなので、入れ直した後に許可を求め直されることがある。`--install` を付けなければ `target/release/HarmonicAnalyzer.app` を作るだけ（`open target/release/HarmonicAnalyzer.app` で起動）。
+
 許可は「システム設定 > プライバシーとセキュリティ > 画面収録とシステムオーディオ録音」で後から変えられる。
+
+アイコンは `assets/AppIcon.icns`。絵は `scripts/make_icon.swift` で描いていて、変えたときは `./scripts/make_icon.sh` で作り直す。
 
 - **画面の構成**: 上の1行目にファイル・ライブ入力・再生・解析位置／再生位置・解析位置の「固定／再生に追従」・試聴の状態（「試聴: 550–770 Hz だけ」など）が常に出る。基音・窓長・表示・試聴フィルタの設定はその下に用途ごとにまとまり、幅が足りなければ折り返す（「設定を隠す」で畳める）。操作の一覧は「？ 操作方法」。
 - **開始画面**: 音源を読み込む前は「WAV を開く」「ライブ入力」「サンプルで試す」が出る。サンプル（基音 220 Hz の4種）はアプリの中で作るので、配布用の `.app` でもファイル無しで開ける。
