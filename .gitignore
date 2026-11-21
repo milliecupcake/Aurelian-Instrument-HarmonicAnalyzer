@@ -1,3 +1,4 @@
 /target
 # cargo run --example gen_test_tones で生成
 /test_tones
+.DS_Store
