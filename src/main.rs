@@ -33,6 +33,8 @@ const LIVE_COLOR: Color32 = Color32::from_rgb(255, 110, 110);
 const OFF_BAR_COLOR: Color32 = Color32::from_rgba_premultiplied(45, 45, 45, 75);
 /// OFF の倍音の行の文字の濃さ（不透明度）
 const OFF_TEXT_ALPHA: f32 = 0.35;
+/// OFF の倍音の時間変化の線の不透明度
+const OFF_LINE_ALPHA: f32 = 0.22;
 const WINDOW_CHOICES: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
 const PALETTE: [Color32; 10] = [
     Color32::from_rgb(86, 156, 255),
@@ -1704,7 +1706,7 @@ impl App {
         let on: Vec<usize> = self.shown.in_range(a.num_in_range).collect();
         let mut focus_click = None;
         section_title(ui, "倍音の時間変化", |ui| {
-            ui.add(egui::Label::new(hint(ui, "共通の dB 目盛り。● は解析位置の値")).truncate());
+            ui.add(egui::Label::new(hint(ui, "共通の dB 目盛り。● は解析位置の値、薄い線は表示 OFF の倍音")).truncate());
         });
         // 凡例はグラフの外に置く（グラフを覆わない）。多いときは折り返し、さらに多ければスクロール
         if on.is_empty() {
@@ -1728,6 +1730,8 @@ impl App {
         }
         let frame = a.frame_at(cursor);
         let focused = self.focused;
+        // OFF の倍音（棒が見えている範囲）は、ON の線の後ろに半透明で薄く描く
+        let off: Vec<usize> = (1..=self.bar_count.min(a.num_in_range)).filter(|&k| !self.shown.contains(k)).collect();
         let r = time_plot("tracks", ui.available_height().max(120.0))
             .default_y_bounds(floor, 3.0)
             .x_axis_label("時間 (秒)")
@@ -1737,6 +1741,12 @@ impl App {
                 Some(format!("{:.3} s\n{:.1} dB", pos.x, pos.y))
             })
             .show(ui, |pu| {
+                for &k in &off {
+                    if let Some(pts) = a.track(k) {
+                        let name = format!("第{k}倍音 {:.0} Hz（OFF）", a.harmonic_hz(k));
+                        pu.line(Line::new(name, pts).color(harmonic_color(k).gamma_multiply(OFF_LINE_ALPHA)).width(1.0));
+                    }
+                }
                 for &k in &on {
                     if let Some(pts) = a.track(k) {
                         let name = format!("第{k}倍音 {:.0} Hz", a.harmonic_hz(k));
