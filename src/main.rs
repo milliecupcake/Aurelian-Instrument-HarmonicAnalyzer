@@ -33,6 +33,9 @@ const LIVE_COLOR: Color32 = Color32::from_rgb(255, 110, 110);
 const OFF_BAR_COLOR: Color32 = Color32::from_rgba_premultiplied(45, 45, 45, 75);
 /// OFF の倍音の行の文字の濃さ（不透明度）
 const OFF_TEXT_ALPHA: f32 = 0.35;
+/// 注目中の倍音があるとき、ほかの倍音の時間変化の線の不透明度
+const UNFOCUSED_ALPHA: f32 = 0.3;
+const FOCUS_TIP: &str = "クリックで注目（もう一度クリックで解除）";
 const WINDOW_CHOICES: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
 const PALETTE: [Color32; 10] = [
     Color32::from_rgb(86, 156, 255),
@@ -76,6 +79,11 @@ const SAMPLES: [Sample; 4] = [
         render: test_tones::inharmonic_750,
     },
 ];
+
+/// 同じ倍音をもう一度クリックしたら注目を解除する
+fn toggle_focus(current: Option<usize>, k: usize) -> Option<usize> {
+    if current == Some(k) { None } else { Some(k) }
+}
 
 fn harmonic_color(k: usize) -> Color32 {
     PALETTE[(k - 1) % PALETTE.len()]
@@ -300,7 +308,7 @@ impl Default for App {
             cursor: 0.0,
             follow: false,
             shown: Shown::default(),
-            focused: Some(1),
+            focused: None,
             bar_count: 32,
             display_floor: -100.0,
             show_harmonic_guides: true,
@@ -698,6 +706,9 @@ impl App {
             if v == "app" {
                 self.source_tab = SourceTab::App;
             }
+        }
+        if let Some(k) = var("HA_FOCUS").and_then(|v| v.parse().ok()) {
+            self.focused = Some(k);
         }
         if var("HA_HELP").is_some() {
             self.show_help = true;
@@ -1159,7 +1170,7 @@ impl App {
                 (
                     "倍音分布と一覧",
                     &[
-                        "棒・一覧の名前をクリック: その倍音に注目する（詳細表示、「第k倍音の周り」）",
+                        "棒・一覧・凡例の名前をクリック: その倍音に注目する（時間変化ではほかの線が薄くなる。もう一度クリックで解除）",
                         "棒の上を横にドラッグ: 範囲内の倍音を選び、まとめて ON／OFF（Esc で取り消し）",
                         "一覧のチェック: 時間変化のグラフに表示する／しない",
                     ],
@@ -1343,7 +1354,7 @@ impl App {
         if let Some(p) = click {
             let k = p.x.round();
             if k >= 1.0 && k <= n as f64 {
-                self.focused = Some(k as usize);
+                self.focused = toggle_focus(self.focused, k as usize);
             }
         }
         if let Some((start, x, done)) = pick_move {
@@ -1402,6 +1413,8 @@ impl App {
             };
             let color = if a.is_in_range(k) { harmonic_color(k) } else { Color32::GRAY };
             ui.label(RichText::new(txt).strong().color(color));
+        } else {
+            ui.label(hint(ui, "注目中の倍音なし（棒か一覧の名前をクリックすると注目）"));
         }
         ui.add_space(4.0);
         let count = self.shown.in_range(a.num_in_range).count();
@@ -1448,8 +1461,8 @@ impl App {
                     if focused {
                         name = name.strong();
                     }
-                    if ui.selectable_label(focused, name).on_hover_text("クリックで注目").clicked() {
-                        self.focused = Some(k);
+                    if ui.selectable_label(focused, name).on_hover_text(FOCUS_TIP).clicked() {
+                        self.focused = toggle_focus(self.focused, k);
                     }
                     ui.label(cell(format!("{:.2} Hz", a.harmonic_hz(k))));
                     match a.level(frame, k) {
@@ -1704,7 +1717,7 @@ impl App {
         let on: Vec<usize> = self.shown.in_range(a.num_in_range).collect();
         let mut focus_click = None;
         section_title(ui, "倍音の時間変化", |ui| {
-            ui.add(egui::Label::new(hint(ui, "共通の dB 目盛り。● は解析位置の値")).truncate());
+            ui.add(egui::Label::new(hint(ui, "共通の dB 目盛り。● は解析位置の値。注目中の倍音以外は薄く表示")).truncate());
         });
         // 凡例はグラフの外に置く（グラフを覆わない）。多いときは折り返し、さらに多ければスクロール
         if on.is_empty() {
@@ -1719,7 +1732,7 @@ impl App {
                         if focused {
                             text = text.strong();
                         }
-                        if ui.selectable_label(focused, text).on_hover_text("クリックで注目").clicked() {
+                        if ui.selectable_label(focused, text).on_hover_text(FOCUS_TIP).clicked() {
                             focus_click = Some(k);
                         }
                     }
@@ -1727,7 +1740,8 @@ impl App {
             });
         }
         let frame = a.frame_at(cursor);
-        let focused = self.focused;
+        // 注目中の倍音が表示されていれば、ほかの線は半透明にしてその1本を際立たせる
+        let focused = self.focused.filter(|k| on.contains(k));
         let r = time_plot("tracks", ui.available_height().max(120.0))
             .default_y_bounds(floor, 3.0)
             .x_axis_label("時間 (秒)")
@@ -1737,15 +1751,20 @@ impl App {
                 Some(format!("{:.3} s\n{:.1} dB", pos.x, pos.y))
             })
             .show(ui, |pu| {
-                for &k in &on {
+                // 注目中の線を最後に描いて、いちばん手前に出す
+                for &k in on.iter().filter(|&&k| Some(k) != focused).chain(focused.iter()) {
                     if let Some(pts) = a.track(k) {
                         let name = format!("第{k}倍音 {:.0} Hz", a.harmonic_hz(k));
-                        let width = if focused == Some(k) { 3.0 } else { 1.5 };
-                        pu.line(Line::new(name.clone(), pts).color(harmonic_color(k)).width(width));
+                        let (color, width) = match focused {
+                            Some(f) if f == k => (harmonic_color(k), 3.0),
+                            Some(_) => (harmonic_color(k).gamma_multiply(UNFOCUSED_ALPHA), 1.2),
+                            None => (harmonic_color(k), 1.5),
+                        };
+                        pu.line(Line::new(name.clone(), pts).color(color).width(width));
                         if let Some(db) = a.level_db(frame, k) {
                             pu.points(
                                 Points::new(name, vec![[a.frame_time(frame), db as f64]])
-                                    .color(harmonic_color(k))
+                                    .color(color)
                                     .radius(4.0)
                                     .filled(true),
                             );
@@ -1758,7 +1777,7 @@ impl App {
         clicked = clicked.or(r.inner.0);
         merge(r.inner.1);
         if let Some(k) = focus_click {
-            self.focused = Some(k);
+            self.focused = toggle_focus(self.focused, k);
         }
 
         if let Some(t) = clicked {
