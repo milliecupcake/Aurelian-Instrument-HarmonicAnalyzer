@@ -1,7 +1,7 @@
 //! 時間変化グラフに表示する倍音の ON／OFF。
 //!
-//! 倍音一覧のトグル、スペクトログラムでの範囲選択、凡例はすべてこの状態を共有する。
-//! 解析範囲外の倍音を ON にしないのは呼び出し側の責任（`harmonics_between` は範囲内だけを返す）。
+//! 倍音一覧のトグル、倍音分布での範囲選択、凡例はすべてこの状態を共有する。
+//! 解析範囲外の倍音を ON にしないのは呼び出し側の責任（`harmonics_in_span` は範囲内だけを返す）。
 
 use std::collections::BTreeSet;
 
@@ -73,13 +73,14 @@ impl Shown {
     }
 }
 
-/// 周波数 `a`〜`b`（向きは問わない、両端を含む）に入る、解析範囲内の倍音
-pub fn harmonics_between(f0: f64, a: f64, b: f64, num_in_range: usize) -> Vec<usize> {
+/// 倍音分布の棒の幅の半分（横軸 = 倍音番号）
+pub const BAR_HALF_WIDTH: f64 = 0.35;
+
+/// 倍音分布の横軸で `a`〜`b`（向きは問わない）をドラッグしたとき、選ばれる倍音。
+/// 棒が少しでも範囲にかかれば選ぶ。第1〜第`max`倍音（表示中かつ解析範囲内）に限る。
+pub fn harmonics_in_span(a: f64, b: f64, max: usize) -> Vec<usize> {
     let (lo, hi) = (a.min(b), a.max(b));
-    if f0 <= 0.0 {
-        return Vec::new();
-    }
-    (1..=num_in_range).filter(|&k| (lo..=hi).contains(&(k as f64 * f0))).collect()
+    (1..=max).filter(|&k| k as f64 + BAR_HALF_WIDTH >= lo && k as f64 - BAR_HALF_WIDTH <= hi).collect()
 }
 
 #[cfg(test)]
@@ -97,10 +98,13 @@ mod tests {
 
     #[test]
     fn range_select_matches_task_example() {
-        // 220 Hz の第7〜第9倍音（1540, 1760, 1980 Hz）を、どちら向きのドラッグでも同じに選ぶ
-        let ks = harmonics_between(220.0, 1450.0, 2000.0, 100);
+        // 第7〜第9倍音の棒にかかる範囲を、どちら向きのドラッグでも同じに選ぶ
+        let ks = harmonics_in_span(6.8, 9.2, 100);
         assert_eq!(ks, vec![7, 8, 9]);
-        assert_eq!(harmonics_between(220.0, 2000.0, 1450.0, 100), ks);
+        assert_eq!(harmonics_in_span(9.2, 6.8, 100), ks);
+        // 棒の間だけにかかる範囲は、かかった棒だけ
+        assert_eq!(harmonics_in_span(7.5, 8.5, 100), vec![8]);
+        assert!(harmonics_in_span(7.4, 7.6, 100).is_empty());
 
         let mut s = Shown::default();
         s.apply(&ks, RangeOp::Only);
@@ -117,8 +121,9 @@ mod tests {
 
     #[test]
     fn out_of_range_harmonics_are_never_picked() {
-        // 範囲内が第5倍音までなら、第7〜第9倍音の帯を選んでも何も入らない
-        assert!(harmonics_between(220.0, 1450.0, 2000.0, 5).is_empty());
+        // 範囲内が第5倍音までなら、第7〜第9倍音の位置を選んでも何も入らない
+        assert!(harmonics_in_span(6.8, 9.2, 5).is_empty());
+        assert_eq!(harmonics_in_span(4.0, 9.0, 5), vec![4, 5]);
         assert_eq!(on(&Shown::default(), 5), vec![1, 2, 3, 4, 5]);
     }
 

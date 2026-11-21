@@ -8,7 +8,7 @@ use egui_plot::{
 use harmonic_analyzer::analysis::{Analysis, FLOOR_DB, HarmonicLevel, WindowSize, analyze, auto_window};
 use harmonic_analyzer::audio_file::{AudioClip, load_wav, write_wav_mono};
 use harmonic_analyzer::filter::{self, Band, BandMode};
-use harmonic_analyzer::harmonics::{DEFAULT_ON, RangeOp, Shown, harmonics_between};
+use harmonic_analyzer::harmonics::{BAR_HALF_WIDTH, DEFAULT_ON, RangeOp, Shown, harmonics_in_span};
 use harmonic_analyzer::live::{AppInfo, LiveInput, Source, audio_apps, input_device_names};
 use harmonic_analyzer::note::{nearest_note, parse_pitch};
 use harmonic_analyzer::playback::Player;
@@ -155,16 +155,7 @@ enum BandEdge {
     High,
 }
 
-/// スペクトログラムをドラッグしたときの動作
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SpecTool {
-    /// 表示を動かす
-    Pan,
-    /// 周波数の範囲で倍音を選ぶ
-    Select,
-}
-
-/// スペクトログラム上で範囲選択した周波数（a = ドラッグ開始, b = 現在／終了）
+/// 倍音分布の上で範囲選択した横軸の位置（倍音番号。a = ドラッグ開始, b = 現在／終了）
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Pick {
     a: f64,
@@ -263,8 +254,7 @@ struct App {
     seek_hover: bool,
     /// 縦線をドラッグ中
     seek_drag: bool,
-    spec_tool: SpecTool,
-    /// スペクトログラム上の範囲選択（確定するまでは ON／OFF に反映しない）
+    /// 倍音分布での範囲選択（確定するまでは ON／OFF に反映しない）
     pick: Option<Pick>,
 
     /// ライブ入力（動作中のみ Some）
@@ -320,7 +310,6 @@ impl Default for App {
             edge_drag: None,
             seek_hover: false,
             seek_drag: false,
-            spec_tool: SpecTool::Pan,
             pick: None,
             live: None,
             live_devices: Vec::new(),
@@ -695,9 +684,8 @@ impl App {
         if let Some(list) = var("HA_SELECT") {
             self.shown = Shown::from_iter(list.split(',').filter_map(|v| v.trim().parse().ok()));
         }
-        // 例: HA_PICK=1450-2000（Hz）で、範囲選択して確定前の状態にする
+        // 例: HA_PICK=7-9（倍音番号）で、倍音分布を範囲選択して確定前の状態にする
         if let Some((a, b)) = var("HA_PICK").as_deref().and_then(|v| v.split_once('-')) {
-            self.spec_tool = SpecTool::Select;
             self.pick = Some(Pick { a: a.parse().unwrap_or(0.0), b: b.parse().unwrap_or(0.0), dragging: false });
         }
         // HA_SOURCES=1 で入力元のウィンドウを開く（HA_SOURCES=app でアプリの音のタブ）
@@ -1162,13 +1150,13 @@ impl App {
                     &[
                         "Shift+ドラッグ: 試聴フィルタの帯域を指定",
                         "帯の上下の線をドラッグ: 帯域の下限・上限を個別に動かす",
-                        "「倍音を範囲選択」にしてドラッグ: 範囲内の倍音をまとめて ON／OFF（Esc で取り消し）",
                     ],
                 ),
                 (
                     "倍音分布と一覧",
                     &[
                         "棒・一覧の名前をクリック: その倍音に注目する（詳細表示、「第k倍音の周り」）",
+                        "棒の上を横にドラッグ: 範囲内の倍音を選び、まとめて ON／OFF（Esc で取り消し）",
                         "一覧のチェック: 時間変化のグラフに表示する／しない",
                     ],
                 ),
@@ -1240,7 +1228,7 @@ impl App {
         ui.label(hint(
             ui,
             format!(
-                "棒をクリックで注目。範囲内: 第1〜第{}倍音（{:.0} Hz 未満）",
+                "棒をクリックで注目、横にドラッグで範囲選択。範囲内: 第1〜第{}倍音（{:.0} Hz 未満）",
                 a.num_in_range,
                 a.nyquist()
             ),
@@ -1248,6 +1236,11 @@ impl App {
 
         let n = self.bar_count;
         let floor = self.display_floor as f64;
+        // 範囲選択できるのは、見えている棒のうち解析範囲内のもの
+        let max_k = n.min(a.num_in_range);
+        let pick = self.pick;
+        let picking = pick.is_some_and(|p| p.dragging);
+        let pick_ks = pick.map(|p| harmonics_in_span(p.a, p.b, max_k)).unwrap_or_default();
         let bars: Vec<Bar> = (1..=n.min(a.num_in_range))
             .map(|k| {
                 let db = a.level_db(frame, k).unwrap() as f64;
@@ -1255,7 +1248,7 @@ impl App {
                 let fill = if on { harmonic_color(k) } else { Color32::from_gray(110) };
                 let mut b = Bar::new(k as f64, db - FLOOR_DB as f64)
                     .base_offset(FLOOR_DB as f64)
-                    .width(0.7)
+                    .width(2.0 * BAR_HALF_WIDTH)
                     .fill(fill)
                     .name(format!("第{k}倍音"));
                 if self.focused == Some(k) {
@@ -1308,13 +1301,83 @@ impl App {
                 ));
             }
             pu.hline(HLine::new("floor", FLOOR_DB as f64).color(Color32::DARK_GRAY).style(LineStyle::dashed_dense()));
-            if pu.response().clicked() { pu.pointer_coordinate() } else { None }
+            // 範囲選択のプレビュー（確定するまで ON／OFF は変えない）
+            if let Some(p) = pick {
+                pu.span(
+                    Span::new("", p.a.min(p.b)..=p.a.max(p.b))
+                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 24))
+                        .border(Stroke::new(1.0, Color32::WHITE)),
+                );
+                let marks: Vec<Bar> = pick_ks
+                    .iter()
+                    .map(|&k| {
+                        Bar::new(k as f64, 3.0 - floor)
+                            .base_offset(floor)
+                            .width(2.0 * BAR_HALF_WIDTH)
+                            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 40))
+                            .stroke(Stroke::new(1.5, Color32::WHITE))
+                    })
+                    .collect();
+                pu.bar_chart(BarChart::new("picked", marks).allow_hover(false));
+            }
+            let resp = pu.response();
+            // 横にドラッグして倍音を範囲選択: (新しく始めたなら開始位置, 現在の位置, 終了したか)
+            let x = resp.interact_pointer_pos().map(|p| pu.plot_from_screen(p).x);
+            let pick_move = if resp.drag_started() {
+                x.map(|x| (Some(x), x, false))
+            } else if picking && (resp.dragged() || resp.drag_stopped()) {
+                x.map(|x| (None, x, resp.drag_stopped()))
+            } else {
+                None
+            };
+            let click = if resp.clicked() { pu.pointer_coordinate() } else { None };
+            (click, pick_move)
         });
-        // 棒のクリックは「注目」だけ。表示の ON／OFF は一覧のチェックで変える
-        if let Some(p) = resp.inner {
+        let (click, pick_move) = resp.inner;
+        // 棒のクリックは「注目」だけ。表示の ON／OFF は一覧のチェックか範囲選択で変える
+        if let Some(p) = click {
             let k = p.x.round();
             if k >= 1.0 && k <= n as f64 {
                 self.focused = Some(k as usize);
+            }
+        }
+        if let Some((start, x, done)) = pick_move {
+            let a0 = start.or(self.pick.map(|p| p.a)).unwrap_or(x);
+            self.pick = Some(Pick { a: a0, b: x, dragging: !done });
+        } else if let Some(p) = &mut self.pick
+            && p.dragging
+            && !ui.input(|i| i.pointer.any_down())
+        {
+            p.dragging = false;
+        }
+        if resp.response.hovered() || picking {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        // 範囲選択の確定
+        let pick = self.pick;
+        let pick_ks = pick.map(|p| harmonics_in_span(p.a, p.b, max_k)).unwrap_or_default();
+        if let Some(p) = pick {
+            let mut op = None;
+            ui.horizontal_wrapped(|ui| {
+                let head = if p.dragging { "範囲選択中:" } else { "範囲選択:" };
+                ui.label(RichText::new(format!("{head} {}", describe_pick(&pick_ks))).strong());
+                let ready = !p.dragging && !pick_ks.is_empty();
+                for (o, label, tip) in [
+                    (RangeOp::Only, "選択のみ ON", "選んだ倍音だけを ON にし、ほかはすべて OFF にする"),
+                    (RangeOp::Add, "追加 ON", "選んだ倍音を ON にする。ほかはそのまま"),
+                    (RangeOp::Off, "選択を OFF", "選んだ倍音を OFF にする。ほかはそのまま"),
+                ] {
+                    if ui.add_enabled(ready, egui::Button::new(label)).on_hover_text(tip).clicked() {
+                        op = Some(o);
+                    }
+                }
+                if ui.button("キャンセル").on_hover_text("Esc").clicked() {
+                    self.pick = None;
+                }
+            });
+            if let Some(o) = op {
+                self.shown.apply(&pick_ks, o);
+                self.pick = None;
             }
         }
 
@@ -1497,51 +1560,18 @@ impl App {
         // スペクトログラム
         let f0 = a.f0;
         let nyq = a.nyquist();
-        let pick = self.pick;
-        let pick_ks = pick.map(|p| harmonics_between(f0, p.a, p.b, a.num_in_range)).unwrap_or_default();
-        let mut pick_op = None;
         section_title(ui, "スペクトログラム", |ui| {
-            ui.label("ドラッグ:");
-            ui.selectable_value(&mut self.spec_tool, SpecTool::Pan, "表示を移動");
-            ui.selectable_value(&mut self.spec_tool, SpecTool::Select, "倍音を範囲選択")
-                .on_hover_text("縦にドラッグした周波数の範囲に入る倍音を選び、まとめて ON／OFF する");
-            ui.add(egui::Label::new(hint(ui, "Shift+ドラッグで試聴帯域")).truncate())
-                .on_hover_text("縦軸 Hz、色 = レベル。ホイールで拡大");
+            ui.add(egui::Label::new(hint(ui, "Shift+ドラッグで試聴帯域、帯の線はドラッグで調整")).truncate())
+                .on_hover_text("縦軸 Hz、色 = レベル。ほかの所のドラッグ／ホイールで移動・拡大");
         });
-        if let Some(p) = pick {
-            ui.horizontal_wrapped(|ui| {
-                let head = if p.dragging { "範囲選択中:" } else { "範囲選択:" };
-                ui.label(RichText::new(format!("{head} {}", describe_pick(&pick_ks))).strong());
-                let ready = !p.dragging && !pick_ks.is_empty();
-                for (op, label, tip) in [
-                    (RangeOp::Only, "選択のみ ON", "選んだ倍音だけを ON にし、ほかはすべて OFF にする"),
-                    (RangeOp::Add, "追加 ON", "選んだ倍音を ON にする。ほかはそのまま"),
-                    (RangeOp::Off, "選択を OFF", "選んだ倍音を OFF にする。ほかはそのまま"),
-                ] {
-                    if ui.add_enabled(ready, egui::Button::new(label)).on_hover_text(tip).clicked() {
-                        pick_op = Some(op);
-                    }
-                }
-                if ui.button("キャンセル").on_hover_text("Esc").clicked() {
-                    self.pick = None;
-                }
-            });
-        }
-        if let Some(op) = pick_op {
-            self.shown.apply(&pick_ks, op);
-            self.pick = None;
-        }
-        let pick = self.pick;
-        let picking = pick.is_some_and(|p| p.dragging);
-        let select_tool = self.spec_tool == SpecTool::Select;
         let fmax = (f0 * (self.bar_count.min(16) as f64 + 1.0)).clamp(1000.0, nyq); // 既定は第16倍音付近まで
         let spec = &a.spectrogram;
         let shift = ui.input(|i| i.modifiers.shift);
         let band = self.filter_on.then_some(self.band);
         let drag_start = self.band_drag_start;
         let edge_drag = self.edge_drag;
-        // 境界線をつかんでいる間・つかめる位置にある間、範囲選択の間はグラフ自体を動かさない
-        let hold = shift || self.edge_hover.is_some() || edge_drag.is_some() || seek_hold || select_tool || picking;
+        // 境界線をつかんでいる間・つかめる位置にある間はグラフ自体を動かさない
+        let hold = shift || self.edge_hover.is_some() || edge_drag.is_some() || seek_hold;
         let r = time_plot("spec", total_h * 0.33)
             .default_y_bounds(0.0, fmax)
             .allow_zoom([true, true])
@@ -1591,18 +1621,6 @@ impl App {
                             .border(Stroke::new(1.5, edge)),
                     );
                 }
-                // 範囲選択のプレビュー（確定するまで ON／OFF は変えない）
-                if let Some(p) = pick {
-                    pu.span(
-                        Span::new("", p.a.min(p.b)..=p.a.max(p.b))
-                            .axis(egui_plot::Axis::Y)
-                            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 30))
-                            .border(Stroke::new(1.0, Color32::WHITE)),
-                    );
-                    for &k in &pick_ks {
-                        pu.hline(HLine::new(format!("選択 第{k}倍音"), k as f64 * f0).color(Color32::WHITE).width(2.0));
-                    }
-                }
                 draw_cursors(pu);
                 let grab = seek_grab(pu, &grab_lines, seek_dragging);
                 let resp = pu.response();
@@ -1611,7 +1629,7 @@ impl App {
                 let band = band.filter(|_| !grab.hover && !seek_dragging);
                 // 境界線の近くにカーソルがあれば、その線をつかめる（近いほうを優先）
                 let hover_edge = match (band, resp.hover_pos()) {
-                    (Some(b), Some(p)) if !shift && !picking => {
+                    (Some(b), Some(p)) if !shift => {
                         let dist = |hz: f64| (pu.screen_from_plot(PlotPoint::new(0.0, hz)).y - p.y).abs();
                         let (dl, dh) = (dist(b.low_hz), dist(b.high_hz));
                         if dl.min(dh) > EDGE_GRAB_PX {
@@ -1633,7 +1651,7 @@ impl App {
                     None
                 };
                 // Shift+ドラッグで試聴フィルタの範囲を指定
-                let band_drag = if edge_move.is_some() || picking {
+                let band_drag = if edge_move.is_some() {
                     None
                 } else if shift && resp.drag_started() {
                     y.map(|y| (y, y, false))
@@ -1644,20 +1662,10 @@ impl App {
                 } else {
                     None
                 };
-                // 倍音の範囲選択: (新しく始めたなら開始周波数, 現在の周波数, 終了したか)
-                let y_drag = resp.interact_pointer_pos().map(|p| pu.plot_from_screen(p).y.max(0.0));
-                let free = !shift && !grab.hover && !seek_dragging && hover_edge.is_none() && edge_drag.is_none();
-                let pick_move = if select_tool && free && drag_start.is_none() && resp.drag_started() {
-                    y_drag.map(|y| (Some(y), y, false))
-                } else if picking && (resp.dragged() || resp.drag_stopped()) {
-                    y_drag.map(|y| (None, y, resp.drag_stopped()))
-                } else {
-                    None
-                };
                 let click = if edge_move.is_some() || hover_edge.is_some() { None } else { click_of(pu) };
-                (click, band_drag, hover_edge, edge_move, grab, pick_move)
+                (click, band_drag, hover_edge, edge_move, grab)
             });
-        let (spec_click, band_drag, hover_edge, edge_move, grab, pick_move) = r.inner;
+        let (spec_click, band_drag, hover_edge, edge_move, grab) = r.inner;
         clicked = clicked.or(spec_click);
         merge(grab);
         self.edge_hover = hover_edge;
@@ -1682,18 +1690,6 @@ impl App {
                 self.band.high_hz = hi;
                 self.filter_on = true;
             }
-        }
-        if let Some((start, y, done)) = pick_move {
-            let a0 = start.or(self.pick.map(|p| p.a)).unwrap_or(y);
-            self.pick = Some(Pick { a: a0, b: y.min(nyq), dragging: !done });
-        } else if let Some(p) = &mut self.pick
-            && p.dragging
-            && !ui.input(|i| i.pointer.any_down())
-        {
-            p.dragging = false;
-        }
-        if select_tool && !grab.hover && hover_edge.is_none() && self.edge_drag.is_none() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
 
         // 表示中の倍音の時間変化
