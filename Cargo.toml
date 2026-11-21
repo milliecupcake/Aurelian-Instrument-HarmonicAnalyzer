@@ -1,0 +1,13 @@
+[package]
+name = "harmonic_analyzer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+eframe = "0.37.0"
+egui_plot = "0.38.0"
+hound = "3.5.1"
+png = "0.18.1"
+realfft = "3.5.1"
+rfd = "0.18.0"
