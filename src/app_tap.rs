@@ -38,6 +38,8 @@ pub struct AudioApp {
     pub name: String,
     /// いま音を出しているか
     pub playing: bool,
+    /// `.app` の中のプロセスか（false ならシステムの内部プロセスなど）
+    pub bundled: bool,
     /// 属するプロセスの Core Audio オブジェクト
     process_objects: Vec<AudioObjectID>,
 }
@@ -129,14 +131,14 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
             continue;
         }
         let path = exe_path(pid);
-        let name = path
-            .as_deref()
-            .and_then(outer_app_name)
+        let app_name = path.as_deref().and_then(outer_app_name);
+        let bundled = app_name.is_some();
+        let name = app_name
             .or_else(|| get_string(obj, kAudioProcessPropertyBundleID).filter(|s| !s.is_empty()))
             .or_else(|| path.as_deref().and_then(|p| p.rsplit('/').next()).map(str::to_string))
             .unwrap_or_else(|| format!("PID {pid}"));
         let playing = get::<u32>(obj, kAudioProcessPropertyIsRunningOutput).unwrap_or(0) != 0;
-        let g = groups.entry(name.clone()).or_insert(AudioApp { name, playing: false, process_objects: Vec::new() });
+        let g = groups.entry(name.clone()).or_insert(AudioApp { name, playing: false, bundled, process_objects: Vec::new() });
         g.playing |= playing;
         g.process_objects.push(obj);
     }
