@@ -1,5 +1,7 @@
 //! 倍音解析エディタ（初版）
 
+mod export_ui;
+
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_plot::{
     Bar, BarChart, FilledArea, HLine, HoverPosition, Line, LineStyle, Plot, PlotImage, PlotPoint, Points, Span,
@@ -7,6 +9,11 @@ use egui_plot::{
 };
 use harmonic_analyzer::analysis::{Analysis, FLOOR_DB, HarmonicLevel, WindowSize, analyze, auto_window};
 use harmonic_analyzer::audio_file::{AudioClip, load_wav, write_wav_mono};
+use harmonic_analyzer::colors;
+use harmonic_analyzer::export::{
+    self, EstimateState, ExportError, ListenFilter, ListenKind, PitchInput, Progress, Snapshot, SourceKind, UserNotes,
+    ViewState,
+};
 use harmonic_analyzer::filter::{self, Band, BandMode, Filter, HarmonicKeep};
 use harmonic_analyzer::harmonics::{BAR_HALF_WIDTH, DEFAULT_ON, RangeOp, Shown, harmonics_in_span};
 use harmonic_analyzer::live::{AppInfo, LiveInput, Source, audio_apps, input_device_names};
@@ -15,7 +22,7 @@ use harmonic_analyzer::pitch::{Estimate, estimate_f0};
 use harmonic_analyzer::playback::Player;
 use harmonic_analyzer::test_tones;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// ライブ入力で保持・表示する長さ（秒）
@@ -38,18 +45,6 @@ const OFF_TEXT_ALPHA: f32 = 0.35;
 const UNFOCUSED_ALPHA: f32 = 0.3;
 const FOCUS_TIP: &str = "クリックで注目（もう一度クリックで解除）";
 const WINDOW_CHOICES: [usize; 6] = [512, 1024, 2048, 4096, 8192, 16384];
-const PALETTE: [Color32; 10] = [
-    Color32::from_rgb(86, 156, 255),
-    Color32::from_rgb(255, 99, 99),
-    Color32::from_rgb(120, 210, 90),
-    Color32::from_rgb(220, 120, 255),
-    Color32::from_rgb(255, 200, 60),
-    Color32::from_rgb(60, 210, 210),
-    Color32::from_rgb(255, 140, 190),
-    Color32::from_rgb(170, 170, 255),
-    Color32::from_rgb(200, 160, 100),
-    Color32::from_rgb(160, 230, 180),
-];
 
 /// 付属のサンプル（アプリの中で生成するので、配布用 .app でもファイル無しで開ける）
 struct Sample {
@@ -87,7 +82,8 @@ fn toggle_focus(current: Option<usize>, k: usize) -> Option<usize> {
 }
 
 fn harmonic_color(k: usize) -> Color32 {
-    PALETTE[(k - 1) % PALETTE.len()]
+    let [r, g, b] = colors::harmonic_rgb(k);
+    Color32::from_rgb(r, g, b)
 }
 
 /// 補足説明の文字色（無効状態の灰色より明るくする）
@@ -143,15 +139,7 @@ fn main() -> eframe::Result {
 }
 
 fn setup_fonts(ctx: &egui::Context) {
-    let candidates = [
-        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "C:\\Windows\\Fonts\\YuGothM.ttc",
-        "C:\\Windows\\Fonts\\meiryo.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ];
-    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else { return };
+    let Some(bytes) = harmonic_analyzer::fonts::load_cjk_font() else { return };
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert("jp".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
     for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
@@ -240,10 +228,15 @@ struct App {
     clip: Option<AudioClip>,
     analysis: Option<Analysis>,
     error: Option<String>,
+    /// clip を入れ替えるたびに増やす。analysis_rev と同じなら、解析結果はいまの音のもの
+    clip_rev: u64,
+    analysis_rev: u64,
+    /// いまの音がライブ入力の録音なら、その入力元（名前, チャンネル数）
+    live_capture: Option<(String, usize)>,
 
     f0_text: String,
-    /// 直前に「推定」した結果（基音を手で変えたら消す）
-    f0_estimate: Option<Estimate>,
+    /// 直前に「推定」した結果と、推定した音の版（clip_rev）。基音を手で変えたら消す
+    f0_estimate: Option<(Estimate, u64)>,
     a4_hz: f64,
     cents: f64,
     window: WindowSize,
@@ -303,8 +296,44 @@ struct App {
     spec_dirty: bool,
     /// ファイルを開くたびに増やし、プロットの表示範囲をリセットする
     generation: u64,
+    /// グラフの表示範囲（最後に描いたもの。書き出しの記録用）: 時間（秒）・周波数（Hz）・レベル（dB）
+    view_time: Option<(f64, f64)>,
+    view_freq: Option<(f64, f64)>,
+    view_level: Option<(f64, f64)>,
+    /// AI 解析用の書き出し
+    export: ExportUi,
+
     /// 開発用: 環境変数 HA_SCREENSHOT=path.png で数フレーム後に画面を保存して終了する
     frames: u64,
+}
+
+/// 「AI解析用に書き出す」の画面と、裏で走っている書き出し
+#[derive(Default)]
+struct ExportUi {
+    open: bool,
+    notes: UserNotes,
+    job: Option<ExportJob>,
+    /// 前回の保存先のフォルダ
+    dir: Option<PathBuf>,
+    /// 区間などの初期値を入れた音の版（clip_rev）。音が変わったら入れ直す
+    defaults_for: Option<u64>,
+    /// 時間区間だけを書き出す（元の音源の秒）
+    range_on: bool,
+    range: (f64, f64),
+    /// 発音開始を指定する（しなければ RMS から推定）
+    onset_manual: bool,
+    onset: f64,
+    /// 持続区間を指定する（しなければ持続区間の代表レベルは出さない）
+    sustain_on: bool,
+    sustain: (f64, f64),
+    /// 直前の書き出しの結果（成功なら保存先）
+    last: Option<Result<PathBuf, String>>,
+}
+
+struct ExportJob {
+    progress: Arc<Progress>,
+    rx: mpsc::Receiver<Result<(), ExportError>>,
+    dest: PathBuf,
 }
 
 impl Default for App {
@@ -316,6 +345,9 @@ impl Default for App {
             clip: None,
             analysis: None,
             error: None,
+            clip_rev: 0,
+            analysis_rev: 0,
+            live_capture: None,
             f0_text: "A3".into(),
             f0_estimate: None,
             a4_hz: 440.0,
@@ -354,6 +386,10 @@ impl Default for App {
             spec_texture: None,
             spec_dirty: true,
             generation: 0,
+            view_time: None,
+            view_freq: None,
+            view_level: None,
+            export: ExportUi::default(),
             frames: 0,
         }
     }
@@ -384,13 +420,20 @@ impl App {
         self.player.set_clip(&clip.interleaved, clip.channels, clip.sample_rate);
         self.filter_applied = None; // 新しい音は元のまま入る。必要なら次のフレームで掛け直す
         self.cursor = (clip.duration() * 0.25).min(0.5);
-        self.clip = Some(clip);
+        self.set_clip(clip);
+        self.live_capture = None;
         self.path = None;
         self.sample = None;
         self.pick = None;
         self.f0_estimate = None;
         self.generation += 1;
         self.reanalyze();
+    }
+
+    /// 音を入れ替える（解析結果は、解析し直すまで古い音のものとして扱う）
+    fn set_clip(&mut self, clip: AudioClip) {
+        self.clip = Some(clip);
+        self.clip_rev += 1;
     }
 
     /// いまの設定で再生音に掛けるべきフィルタ（無効なら None）
@@ -438,7 +481,7 @@ impl App {
                 let (name, dev) = nearest_note(e.hz, self.a4_hz);
                 self.f0_text = name;
                 self.cents = (dev * 10.0).round() / 10.0;
-                self.f0_estimate = Some(e);
+                self.f0_estimate = Some((e, self.clip_rev));
                 true
             }
             None => {
@@ -480,6 +523,7 @@ impl App {
             a.frame_time(a.frame_at(self.cursor))
         };
         self.analysis = Some(a);
+        self.analysis_rev = self.clip_rev;
         self.error = None;
         self.spec_dirty = true;
     }
@@ -508,7 +552,8 @@ impl App {
         match LiveInput::open(&self.live_source, LIVE_SECONDS) {
             Ok(live) => {
                 let silent = vec![0.0; (LIVE_SECONDS * live.sample_rate as f64).round() as usize];
-                self.clip = Some(AudioClip::from_mono(silent, live.sample_rate));
+                self.set_clip(AudioClip::from_mono(silent, live.sample_rate));
+                self.live_capture = Some((live.device_name.clone(), live.channels));
                 self.path = None;
                 self.sample = None;
                 self.pick = None;
@@ -532,6 +577,8 @@ impl App {
             self.player.set_clip(&clip.interleaved, clip.channels, clip.sample_rate);
             self.filter_applied = None;
         }
+        // 残った音を、いまの設定で解析し直す（画像・音声・数値が必ず同じ音を表すように）
+        self.reanalyze();
     }
 
     /// 解析結果を受け取り、間隔が空いていれば次の解析を裏で始める
@@ -540,7 +587,7 @@ impl App {
             match rx.try_recv() {
                 Ok((samples, sr, res)) => {
                     self.live_job = None;
-                    self.clip = Some(AudioClip::from_mono(samples, sr));
+                    self.set_clip(AudioClip::from_mono(samples, sr));
                     match res {
                         Ok(a) => self.set_analysis(a),
                         Err(e) => self.error = Some(e),
@@ -633,19 +680,8 @@ impl App {
 
 /// 黒 → 紫 → 橙 → 黄白（magma 風）
 fn colormap(x: f32) -> Color32 {
-    const STOPS: [(f32, [f32; 3]); 5] = [
-        (0.0, [0.0, 0.0, 0.02]),
-        (0.3, [0.23, 0.06, 0.44]),
-        (0.55, [0.71, 0.21, 0.47]),
-        (0.8, [0.98, 0.53, 0.28]),
-        (1.0, [0.99, 0.99, 0.75]),
-    ];
-    let i = STOPS.iter().position(|s| s.0 >= x).unwrap_or(4).max(1);
-    let (x0, c0) = STOPS[i - 1];
-    let (x1, c1) = STOPS[i];
-    let t = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0);
-    let ch = |j: usize| ((c0[j] + (c1[j] - c0[j]) * t) * 255.0) as u8;
-    Color32::from_rgb(ch(0), ch(1), ch(2))
+    let [r, g, b] = colors::colormap(x);
+    Color32::from_rgb(r, g, b)
 }
 
 fn save_png(path: &str, img: &egui::ColorImage) {
@@ -664,6 +700,14 @@ fn hover_pos(p: &HoverPosition<'_>) -> PlotPoint {
         HoverPosition::NearDataPoint { position, .. } | HoverPosition::Elsewhere { position } => *position,
     }
 }
+
+/// 実測ピークの欄（探索範囲内に局所ピークが無ければ「未検出」）
+fn fmt_peak(hz: Option<f32>) -> String {
+    hz.map(|h| format!("{h:.2} Hz")).unwrap_or_else(|| "未検出".into())
+}
+
+const PEAK_TIP: &str = "対象周波数 ± 基音の 10% で局所ピークを探した結果。\n\
+    「未検出」はピークが無く、対象に最も近い FFT ビンの値をレベルに使ったもの";
 
 fn fmt_db(v: f32) -> String {
     if v <= FLOOR_DB { format!("≤ {FLOOR_DB:.0} dB（下限）") } else { format!("{v:.1} dB") }
@@ -692,6 +736,7 @@ impl eframe::App for App {
             self.rebuild_spec_texture(&ctx);
         }
         self.sync_filter(&ctx);
+        self.poll_export(&ctx);
         self.frames += 1;
         if let Ok(path) = std::env::var("HA_SCREENSHOT") {
             if self.frames == 1 {
@@ -720,6 +765,7 @@ impl eframe::App for App {
         });
         self.source_window(&ctx);
         self.help_window(&ctx);
+        self.export_window(&ctx);
     }
 }
 
@@ -774,6 +820,40 @@ impl App {
         if let Some(k) = var("HA_FOCUS").and_then(|v| v.parse().ok()) {
             self.focused = Some(k);
         }
+        // HA_EXPORT=out.zip で、いまの状態を書き出す（結果は標準エラーに出す）。HA_EXPORT_DIALOG=1 で書き出し画面
+        if let Some(dest) = var("HA_EXPORT") {
+            self.export.notes.question = var("HA_EXPORT_QUESTION").unwrap_or_default();
+            // 例: HA_EXPORT_RANGE=0.5-1.5、HA_EXPORT_SUSTAIN=0.3-1.2、HA_EXPORT_ONSET=0.05（いずれも元の音源の秒）
+            self.export_defaults();
+            let pair = |v: Option<String>| {
+                v.and_then(|v| v.split_once('-').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+            };
+            if let Some(r) = pair(var("HA_EXPORT_RANGE")) {
+                self.export.range_on = true;
+                self.export.range = r;
+            }
+            if let Some(r) = pair(var("HA_EXPORT_SUSTAIN")) {
+                self.export.sustain_on = true;
+                self.export.sustain = r;
+            }
+            if let Some(t) = var("HA_EXPORT_ONSET").and_then(|v| v.parse().ok()) {
+                self.export.onset_manual = true;
+                self.export.onset = t;
+            }
+            match self.export_snapshot() {
+                Ok(snap) => {
+                    let font = harmonic_analyzer::fonts::load_cjk_font();
+                    let r = export::export_zip(&snap, std::path::Path::new(&dest), font.as_deref(), &Progress::default());
+                    eprintln!("HA_EXPORT {dest}: {r:?}");
+                    self.export.last = Some(r.map(|()| PathBuf::from(&dest)).map_err(|e| e.to_string()));
+                }
+                Err(e) => eprintln!("HA_EXPORT {dest}: {e}"),
+            }
+        }
+        if var("HA_EXPORT_DIALOG").is_some() {
+            self.export_defaults();
+            self.export.open = true;
+        }
         if var("HA_HELP").is_some() {
             self.show_help = true;
         }
@@ -790,6 +870,16 @@ impl App {
                 self.open(p);
             }
             self.live_controls(ui);
+            let busy = self.export.job.is_some();
+            let label = if busy { "書き出し中…" } else { "AI解析用に書き出す…" };
+            if ui
+                .button(label)
+                .on_hover_text("音声・全倍音の数値・解析条件・概要画像・要約を 1 つの ZIP に保存する（AI や外部のプログラムで調べる用）")
+                .clicked()
+            {
+                self.export_defaults();
+                self.export.open = true;
+            }
             ui.separator();
 
             let playing = self.player.is_playing();
@@ -965,7 +1055,7 @@ impl App {
                 }
                 match self.resolved_f0() {
                     Ok(f0) => {
-                        if let Some(e) = self.f0_estimate {
+                        if let Some((e, _)) = self.f0_estimate {
                             let sure = if e.confidence >= 0.8 { "高" } else if e.confidence >= 0.5 { "中" } else { "低" };
                             ui.label(hint(ui, format!("推定 {:.2} Hz（確からしさ {sure}）", e.hz))).on_hover_text(format!(
                                 "音のある区間のうち {:.0}% で同じ周期が見つかった。\n\
@@ -1268,7 +1358,7 @@ impl App {
     fn help_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_help;
         egui::Window::new("操作方法").open(&mut open).default_width(520.0).show(ctx, |ui| {
-            let items: [(&str, &[&str]); 5] = [
+            let items: [(&str, &[&str]); 6] = [
                 (
                     "波形・スペクトログラム・倍音の時間変化（時間軸は共通）",
                     &[
@@ -1293,6 +1383,13 @@ impl App {
                     ],
                 ),
                 ("再生", &["Space: 再生／停止", "「再生に追従」: 再生中は解析位置が再生位置についていく"]),
+                (
+                    "書き出し",
+                    &[
+                        "「AI解析用に書き出す…」: 音声・全倍音の数値・解析条件・概要画像・要約を 1 つの ZIP に保存（ライブ停止後に使える）",
+                        "実測ピークの「未検出」: 探索範囲に局所ピークが無く、対象に最も近いビンの値をレベルに使ったもの",
+                    ],
+                ),
                 (
                     "レベルの基準",
                     &["0 dB = 振幅 1.0（フルスケール）の正弦波。録音全体・全倍音で共通。下限は −120 dB"],
@@ -1518,10 +1615,10 @@ impl App {
         ui.add_space(6.0);
         if let Some(k) = self.focused {
             let txt = match a.level(frame, k) {
-                HarmonicLevel::Level { db, peak_hz } => format!(
-                    "▶ 第{k}倍音   対象 {:.2} Hz   実測ピーク {:.2} Hz   {}",
+                HarmonicLevel::Level { db, peak_hz, .. } => format!(
+                    "▶ 第{k}倍音   対象 {:.2} Hz   実測ピーク {}   {}",
                     a.harmonic_hz(k),
-                    peak_hz,
+                    fmt_peak(peak_hz),
                     fmt_db(db)
                 ),
                 HarmonicLevel::OutOfRange => {
@@ -1583,8 +1680,8 @@ impl App {
                     }
                     ui.label(cell(format!("{:.2} Hz", a.harmonic_hz(k))));
                     match a.level(frame, k) {
-                        HarmonicLevel::Level { db, peak_hz } => {
-                            ui.label(cell(format!("{peak_hz:.2} Hz")));
+                        HarmonicLevel::Level { db, peak_hz, .. } => {
+                            ui.label(cell(fmt_peak(peak_hz))).on_hover_text(PEAK_TIP);
                             ui.label(cell(fmt_db(db)));
                         }
                         HarmonicLevel::OutOfRange => {
@@ -1688,6 +1785,7 @@ impl App {
                 (click_of(pu), seek_grab(pu, &grab_lines, seek_dragging))
             });
         clicked = clicked.or(r.inner.0);
+        self.view_time = Some((r.transform.bounds().min()[0], r.transform.bounds().max()[0]));
         merge(r.inner.1);
 
         let Some(a) = &self.analysis else {
@@ -1819,6 +1917,7 @@ impl App {
                 (click, band_drag, hover_edge, edge_move, grab)
             });
         let (spec_click, band_drag, hover_edge, edge_move, grab) = r.inner;
+        self.view_freq = Some((r.transform.bounds().min()[1], r.transform.bounds().max()[1]));
         clicked = clicked.or(spec_click);
         merge(grab);
         self.edge_hover = hover_edge;
@@ -1908,6 +2007,7 @@ impl App {
                 (click_of(pu), seek_grab(pu, &grab_lines, seek_dragging))
             });
         clicked = clicked.or(r.inner.0);
+        self.view_level = Some((r.transform.bounds().min()[1], r.transform.bounds().max()[1]));
         merge(r.inner.1);
         if let Some(k) = focus_click {
             self.focused = toggle_focus(self.focused, k);

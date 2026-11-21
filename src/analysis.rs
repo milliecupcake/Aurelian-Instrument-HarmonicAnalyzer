@@ -3,6 +3,7 @@
 //! - 各フレームで 4項 Blackman-Harris 窓（サイドローブ -92 dB）をかけ、2倍のゼロ詰めをして FFT する。
 //! - 第k倍音（k·f0）の周辺 ±10%·f0 で振幅ピークを探し、対数振幅の放物線補間で
 //!   ビンの間に来る周波数の振幅を推定する。範囲内に極大が無いときは k·f0 に最も近いビンの値を使う。
+//!   どちらだったか（と下限以下か）は `PeakStatus` で区別できる。
 //! - 振幅は「振幅 1.0 の正弦波 = 0 dB」となるよう正規化し、録音全体・全倍音で共通の基準とする。
 //! - k·f0 がナイキスト周波数（fs/2）以上の倍音は「範囲外」とし、値を持たない。
 
@@ -74,10 +75,36 @@ impl Spectrogram {
     }
 }
 
+/// 倍音の値をどう得たか。
+///
+/// `DetectedPeak` は探索範囲内に局所ピークがあったという意味で、その楽器由来の倍音であることは保証しない
+/// （窓のサイドローブや雑音の山でも局所ピークになる）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeakStatus {
+    /// 探索範囲内の局所ピークを検出し、放物線補間した。
+    DetectedPeak,
+    /// 局所ピークが無く、目標周波数に最も近い FFT ビンの値を読んだ。
+    SampledTargetBin,
+    /// 値が下限（FLOOR_DB）以下。真のレベルは分からない。
+    BelowFloor,
+}
+
+impl PeakStatus {
+    /// 書き出し用の名前
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeakStatus::DetectedPeak => "detected_peak",
+            PeakStatus::SampledTargetBin => "sampled_target_bin",
+            PeakStatus::BelowFloor => "below_floor",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HarmonicLevel {
     /// 範囲内。値は dB（下限 FLOOR_DB でクランプ済み）。
-    Level { db: f32, peak_hz: f32 },
+    /// `peak_hz` はピークを検出したときだけ、`sampled_bin_hz` は検出できずにビンを読んだときだけ持つ。
+    Level { db: f32, peak_hz: Option<f32>, sampled_bin_hz: Option<f32>, status: PeakStatus },
     /// k·f0 がナイキスト周波数以上。
     OutOfRange,
 }
@@ -91,9 +118,17 @@ pub struct Analysis {
     pub fft_size: usize,
     pub num_frames: usize,
     pub num_in_range: usize,
+    /// 解析したモノラル音声のサンプル数
+    pub num_samples: usize,
+    /// ピークを探した範囲（片側、FFT ビン数。基音の SEARCH_TOLERANCE 倍、最低 1 ビン）
+    pub search_half_width_bins: f64,
     /// `levels[frame * num_in_range + (k - 1)]`
     levels: Vec<f32>,
-    peak_hz: Vec<f32>,
+    /// 検出したピーク、または読んだビンの周波数（どちらかは status で決まる）
+    hz: Vec<f32>,
+    status: Vec<PeakStatus>,
+    /// フレームごとのスペクトル重心（Hz）。無音なら None
+    centroid: Vec<Option<f32>>,
     pub spectrogram: Spectrogram,
 }
 
@@ -102,6 +137,24 @@ impl Analysis {
         self.sample_rate as f64 / 2.0
     }
 
+    /// FFT の 1 ビンの幅（Hz）
+    pub fn bin_hz(&self) -> f64 {
+        self.sample_rate as f64 / self.fft_size as f64
+    }
+
+    /// 窓が音声の先頭より前、または末尾より後にかかり、その部分をゼロで埋めたフレームか
+    pub fn is_edge_padded(&self, frame: usize) -> bool {
+        let start = (frame * self.hop) as isize - (self.window / 2) as isize;
+        start < 0 || start as usize + self.window > self.num_samples
+    }
+
+    /// スペクトル重心（Hz）。縮約前の線形振幅スペクトル（DC を除く全ビン）を振幅で重み付けした平均周波数。
+    /// どのビンも下限（−120 dB）以下のフレーム（無音）は None
+    pub fn spectral_centroid(&self, frame: usize) -> Option<f64> {
+        self.centroid.get(frame).copied().flatten().map(f64::from)
+    }
+
+    /// 窓の中心の時刻（秒）
     pub fn frame_time(&self, frame: usize) -> f64 {
         frame as f64 * self.hop as f64 / self.sample_rate as f64
     }
@@ -125,7 +178,14 @@ impl Analysis {
             return HarmonicLevel::OutOfRange;
         }
         let i = frame * self.num_in_range + (k - 1);
-        HarmonicLevel::Level { db: self.levels[i], peak_hz: self.peak_hz[i] }
+        let (hz, status) = (self.hz[i], self.status[i]);
+        let detected = status == PeakStatus::DetectedPeak;
+        HarmonicLevel::Level {
+            db: self.levels[i],
+            peak_hz: detected.then_some(hz),
+            sampled_bin_hz: (!detected).then_some(hz),
+            status,
+        }
     }
 
     pub fn level_db(&self, frame: usize, k: usize) -> Option<f32> {
@@ -183,7 +243,9 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
     let mut mag = vec![0f64; bins];
 
     let mut levels = Vec::with_capacity(num_frames * num_in_range);
-    let mut peaks = Vec::with_capacity(num_frames * num_in_range);
+    let mut hzs = Vec::with_capacity(num_frames * num_in_range);
+    let mut statuses = Vec::with_capacity(num_frames * num_in_range);
+    let mut centroids = Vec::with_capacity(num_frames);
 
     // スペクトログラムの縮約
     let row_pool = bins.div_ceil(MAX_SPEC_ROWS);
@@ -212,10 +274,27 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
         // 倍音
         for k in 1..=num_in_range {
             let target = k as f64 * f0 / bin_hz;
-            let (amp, hz) = estimate_peak(&mag, target, tol_bins, bin_hz);
-            levels.push(amp_to_db(amp));
-            peaks.push(hz as f32);
+            let (amp, hz, detected) = estimate_peak(&mag, target, tol_bins, bin_hz);
+            let db = amp_to_db(amp);
+            levels.push(db);
+            hzs.push(hz as f32);
+            statuses.push(if db <= FLOOR_DB {
+                PeakStatus::BelowFloor
+            } else if detected {
+                PeakStatus::DetectedPeak
+            } else {
+                PeakStatus::SampledTargetBin
+            });
         }
+
+        // スペクトル重心（線形振幅で重み付け、DC を除く）
+        let (mut wsum, mut fsum, mut peak) = (0.0f64, 0.0f64, 0.0f64);
+        for (b, &m) in mag.iter().enumerate().skip(1) {
+            wsum += m;
+            fsum += m * b as f64 * bin_hz;
+            peak = peak.max(m);
+        }
+        centroids.push((peak > FLOOR_AMP && wsum > 0.0).then(|| (fsum / wsum) as f32));
 
         // スペクトログラム（各セルは最大値で縮約）
         let col = frame / col_pool;
@@ -236,8 +315,12 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
         fft_size: m,
         num_frames,
         num_in_range,
+        num_samples: samples.len(),
+        search_half_width_bins: tol_bins,
         levels,
-        peak_hz: peaks,
+        hz: hzs,
+        status: statuses,
+        centroid: centroids,
         spectrogram: Spectrogram {
             cols,
             rows,
@@ -248,14 +331,15 @@ pub fn analyze(samples: &[f32], sample_rate: u32, f0: f64, window: WindowSize) -
     })
 }
 
-/// target（ビン単位、小数可）の ±tol ビンの範囲でピークを探し、振幅と周波数を返す。
-fn estimate_peak(mag: &[f64], target: f64, tol: f64, bin_hz: f64) -> (f64, f64) {
+/// target（ビン単位、小数可）の ±tol ビンの範囲でピークを探し、振幅・周波数・局所ピークを検出したかを返す。
+/// 検出できなければ、target に最も近いビンの振幅とそのビンの周波数を返す。
+fn estimate_peak(mag: &[f64], target: f64, tol: f64, bin_hz: f64) -> (f64, f64, bool) {
     let last = mag.len() - 1;
     let lo = ((target - tol).floor().max(1.0)) as usize;
     let hi = ((target + tol).ceil() as usize).min(last - 1);
     let nearest = (target.round() as usize).clamp(1, last - 1);
     if lo > hi {
-        return (mag[nearest], nearest as f64 * bin_hz);
+        return (mag[nearest], nearest as f64 * bin_hz, false);
     }
     let mut best = lo;
     for b in lo..=hi {
@@ -265,8 +349,8 @@ fn estimate_peak(mag: &[f64], target: f64, tol: f64, bin_hz: f64) -> (f64, f64) 
     }
     let is_local_max = mag[best] >= mag[best - 1] && mag[best] >= mag[best + 1] && mag[best] > FLOOR_AMP;
     if !is_local_max {
-        // 範囲内に極大が無い（隣の成分の裾など）→ 目標周波数のビンの値
-        return (mag[nearest], target * bin_hz);
+        // 範囲内に極大が無い（隣の成分の裾など）→ 目標周波数に最も近いビンの値
+        return (mag[nearest], nearest as f64 * bin_hz, false);
     }
     // 対数振幅の放物線補間
     // 下限より十分小さい値で切り、補正量はスカロッピング損失の上限（約 0.5 dB）までに抑える
@@ -275,5 +359,72 @@ fn estimate_peak(mag: &[f64], target: f64, tol: f64, bin_hz: f64) -> (f64, f64) 
     let denom = a - 2.0 * b + c;
     let p = if denom < -1e-12 { (0.5 * (a - c) / denom).clamp(-0.5, 0.5) } else { 0.0 };
     let peak_ln = (b - 0.25 * (a - c) * p).min(b + 0.06);
-    (peak_ln.exp(), (best as f64 + p) * bin_hz)
+    (peak_ln.exp(), (best as f64 + p) * bin_hz, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_tones::{SR, inharmonic_750, sine_220};
+
+    fn status(a: &Analysis, f: usize, k: usize) -> (PeakStatus, Option<f32>, Option<f32>) {
+        match a.level(f, k) {
+            HarmonicLevel::Level { status, peak_hz, sampled_bin_hz, .. } => (status, peak_hz, sampled_bin_hz),
+            HarmonicLevel::OutOfRange => panic!("範囲外"),
+        }
+    }
+
+    #[test]
+    fn detected_peak_has_peak_hz_only() {
+        let a = analyze(&sine_220(), SR, 220.0, WindowSize::Auto).unwrap();
+        let (s, peak, bin) = status(&a, a.frame_at(1.0), 1);
+        assert_eq!(s, PeakStatus::DetectedPeak);
+        assert!((peak.unwrap() - 220.0).abs() < 0.5);
+        assert_eq!(bin, None);
+    }
+
+    #[test]
+    fn silence_is_below_floor_with_bin_frequency() {
+        let a = analyze(&vec![0.0; SR as usize], SR, 220.0, WindowSize::Auto).unwrap();
+        for k in [1, 2, 50] {
+            let (s, peak, bin) = status(&a, a.frame_at(0.5), k);
+            assert_eq!(s, PeakStatus::BelowFloor);
+            assert_eq!(peak, None, "検出していない周波数を実測ピークとして出さない");
+            // 読んだのは実際のビン（目標周波数そのものではない）
+            let bin = bin.unwrap() as f64;
+            assert!((bin / a.bin_hz() - (bin / a.bin_hz()).round()).abs() < 1e-3);
+            assert!((bin - k as f64 * 220.0).abs() <= a.bin_hz() / 2.0 + 1e-3);
+        }
+    }
+
+    #[test]
+    fn inharmonic_750_is_not_reported_as_a_harmonic_peak() {
+        let a = analyze(&inharmonic_750(), SR, 220.0, WindowSize::Auto).unwrap();
+        let f = a.frame_at(1.0);
+        for k in 1..=a.num_in_range {
+            if let (PeakStatus::DetectedPeak, Some(p), _) = status(&a, f, k) {
+                assert!((p as f64 - k as f64 * 220.0).abs() <= 0.1 * 220.0 + a.bin_hz(), "第{k}倍音のピーク {p} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn centroid_of_sine_is_its_frequency_and_silence_has_none() {
+        let a = analyze(&sine_220(), SR, 220.0, WindowSize::Auto).unwrap();
+        let c = a.spectral_centroid(a.frame_at(1.0)).unwrap();
+        assert!((c - 220.0).abs() < 1.0, "{c}");
+        let s = analyze(&vec![0.0; SR as usize], SR, 220.0, WindowSize::Auto).unwrap();
+        assert!((0..s.num_frames).all(|f| s.spectral_centroid(f).is_none()));
+    }
+
+    #[test]
+    fn edge_frames_are_flagged() {
+        let a = analyze(&sine_220(), SR, 220.0, WindowSize::Auto).unwrap();
+        assert!(a.is_edge_padded(0));
+        assert!(a.is_edge_padded(a.num_frames - 1));
+        assert!(!a.is_edge_padded(a.frame_at(1.0)));
+        // 窓が収まる最初のフレームは窓の半分の時刻から
+        let first = (0..a.num_frames).find(|&f| !a.is_edge_padded(f)).unwrap();
+        assert!(a.frame_time(first) >= a.window as f64 / 2.0 / SR as f64);
+    }
 }
