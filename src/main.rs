@@ -1,6 +1,7 @@
 //! 倍音解析エディタ（初版）
 
 mod export_ui;
+mod skin;
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_plot::{
@@ -32,15 +33,23 @@ const LIVE_INTERVAL: Duration = Duration::from_millis(70);
 
 type LiveResult = (Vec<f32>, u32, Result<Analysis, String>);
 
-const CURSOR_COLOR: Color32 = Color32::from_rgb(255, 160, 40);
-const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
-const KEEP_COLOR: Color32 = Color32::from_rgb(80, 220, 255);
-const REMOVE_COLOR: Color32 = Color32::from_rgb(255, 90, 90);
-const LIVE_COLOR: Color32 = Color32::from_rgb(255, 110, 110);
-/// OFF の倍音の棒（半透明の灰色）
-const OFF_BAR_COLOR: Color32 = Color32::from_rgba_premultiplied(45, 45, 45, 75);
-/// OFF の倍音の行の文字の濃さ（不透明度）
-const OFF_TEXT_ALPHA: f32 = 0.35;
+/// グラフの見出し（銘板）の行の高さ
+const PLAQUE_ROW: f32 = 32.0 + 5.0;
+/// 時間変化の凡例の高さ（最大）
+const LEGEND_ROW: f32 = 46.0 + 5.0;
+/// 解析位置（書き出し画像と共通の colors::CURSOR_RGB）
+const CURSOR_COLOR: Color32 = Color32::from_rgb(colors::CURSOR_RGB[0], colors::CURSOR_RGB[1], colors::CURSOR_RGB[2]);
+const PLAYHEAD_COLOR: Color32 = skin::PLAYHEAD;
+const KEEP_COLOR: Color32 = skin::CYAN;
+const REMOVE_COLOR: Color32 = skin::DANGER;
+const LIVE_COLOR: Color32 = skin::DANGER;
+const ERROR_COLOR: Color32 = skin::DANGER;
+/// 波形の色
+const WAVE_COLOR: Color32 = skin::CYAN;
+/// OFF の倍音の棒（半透明の鈍い真鍮灰色）
+const OFF_BAR_COLOR: Color32 = Color32::from_rgba_premultiplied(52, 49, 38, 110);
+/// OFF の倍音の行の文字の濃さ（不透明度）。弱めても背景と区別できる明るさにする
+const OFF_TEXT_ALPHA: f32 = 0.65;
 /// 注目中の倍音があるとき、ほかの倍音の時間変化の線の不透明度
 const UNFOCUSED_ALPHA: f32 = 0.3;
 const FOCUS_TIP: &str = "クリックで注目（もう一度クリックで解除）";
@@ -87,8 +96,8 @@ fn harmonic_color(k: usize) -> Color32 {
 }
 
 /// 補足説明の文字色（無効状態の灰色より明るくする）
-fn hint_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode { Color32::from_gray(178) } else { Color32::from_gray(70) }
+fn hint_color(_ui: &egui::Ui) -> Color32 {
+    skin::TEXT_SECONDARY
 }
 
 fn hint(ui: &egui::Ui, text: impl Into<String>) -> RichText {
@@ -108,12 +117,21 @@ fn wrap_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) 
     r.inner
 }
 
-/// グラフの見出し（名前 + 補足。補足は狭いと省略し、全文はカーソルを乗せると出る）
+/// グラフの見出し（真鍮の銘板 + 補足。補足は狭いと省略し、全文はカーソルを乗せると出る）
 fn section_title(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).strong().size(15.0).color(ui.visuals().strong_text_color()));
+        skin::plaque(ui, title);
         add(ui);
     });
+}
+
+/// 時間グラフの上端に、解析位置の三角マーカーを置く（縦線と同じ座標変換で x を求める）
+fn mark_cursor(ui: &egui::Ui, transform: &egui_plot::PlotTransform, t: f64) {
+    let frame = *transform.frame();
+    let x = transform.position_from_point(&PlotPoint::new(t, 0.0)).x;
+    if x >= frame.left() && x <= frame.right() {
+        skin::cursor_marker(ui.painter(), x, frame.top(), CURSOR_COLOR);
+    }
 }
 
 fn main() -> eframe::Result {
@@ -129,6 +147,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
+            skin::install(&cc.egui_ctx);
             let mut app = App::default();
             if let Some(p) = initial {
                 app.open(p);
@@ -139,13 +158,26 @@ fn main() -> eframe::Result {
 }
 
 fn setup_fonts(ctx: &egui::Context) {
-    let Some(bytes) = harmonic_analyzer::fonts::load_cjk_font() else { return };
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("jp".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        // 英数字と日本語のベースラインをそろえるため、日本語フォントを最優先にする
-        fonts.families.entry(fam).or_default().insert(0, "jp".into());
+    let proportional = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    if let Some(bytes) = harmonic_analyzer::fonts::load_cjk_font() {
+        fonts.font_data.insert("jp".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            // 英数字と日本語のベースラインをそろえるため、日本語フォントを最優先にする
+            fonts.families.entry(fam).or_default().insert(0, "jp".into());
+        }
     }
+    // 銘板・見出し用: OS のセリフ体（あれば）→ 本文と同じフォント。日本語は後ろの日本語フォントで描く
+    let mut heading = Vec::new();
+    if let Some(bytes) = harmonic_analyzer::fonts::load_serif_font() {
+        fonts.font_data.insert("serif".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        heading.push("serif".to_string());
+    }
+    if fonts.font_data.contains_key("jp") {
+        heading.push("jp".into());
+    }
+    heading.extend(proportional);
+    fonts.families.insert(skin::heading_family(), heading);
     ctx.set_fonts(fonts);
 }
 
@@ -752,11 +784,27 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        // 筐体（暗緑 + 金属テクスチャ）を最初に敷き、各パネルは透明にしてその上に載せる
+        let screen = ui.max_rect();
+        skin::paint_chassis(ui.painter(), screen);
+        skin::paint_corner_screws(ui.painter(), screen);
+        let clear = |m: egui::Margin| egui::Frame::NONE.inner_margin(m);
+        let toolbar = egui::Panel::top("toolbar")
+            .frame(clear(egui::Margin { left: 16, right: 16, top: 8, bottom: 6 }))
+            .show(ui, |ui| self.toolbar(ui));
+        // ツールバーと本体の境目に真鍮の線
+        let y = toolbar.response.rect.bottom();
+        ui.painter().hline(screen.x_range().shrink(16.0), y, Stroke::new(1.0, skin::BRASS.gamma_multiply(0.7)));
         if self.clip.is_some() {
-            egui::Panel::right("harmonics").resizable(true).default_size(470.0).show(ui, |ui| self.harmonic_panel(ui));
+            // 初期幅は画面幅の 30%（340〜480）。リサイズした幅は egui が覚えている
+            let w = (screen.width() * 0.30).clamp(340.0, 480.0);
+            egui::Panel::right("harmonics")
+                .resizable(true)
+                .default_size(w)
+                .frame(clear(egui::Margin { left: 6, right: 16, top: 10, bottom: 14 }))
+                .show(ui, |ui| self.harmonic_panel(ui));
         }
-        egui::CentralPanel::default_margins().show(ui, |ui| {
+        egui::CentralPanel::default_margins().frame(clear(egui::Margin { left: 16, right: 6, top: 10, bottom: 14 })).show(ui, |ui| {
             if self.clip.is_some() {
                 self.time_views(ui);
             } else {
@@ -860,74 +908,92 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        // 1 行目: ファイル・入力、再生、時刻、試聴の状態（常に見える）
-        let mut label_below = false;
-        ui.horizontal(|ui| {
-            if ui.button("WAV を開く…").clicked()
+        // 1 行目: 銘板と主要な操作（幅が足りなければ折り返す）
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            // 狭いときと、大きな銘板を出す開始画面では省く
+            if ui.available_width() >= 1200.0 && self.clip.is_some() {
+                skin::nameplate(ui, "Aurelian Instruments", "倍音解析エディタ", 20.0);
+                ui.add_space(6.0);
+            }
+            if skin::button(ui, Some(skin::Icon::Folder), "WAV を開く…", skin::Active::No).clicked()
                 && let Some(p) = rfd::FileDialog::new().add_filter("WAV", &["wav", "wave"]).pick_file()
             {
                 self.open(p);
             }
             self.live_controls(ui);
+
+            let playing = self.player.is_playing();
+            let can_play = self.clip.is_some() && self.live.is_none();
+            let (icon, label, active) = if playing {
+                (skin::Icon::Stop, "停止", skin::Active::Amber)
+            } else {
+                (skin::Icon::Play, "再生", skin::Active::No)
+            };
+            if ui.add_enabled_ui(can_play, |ui| skin::button(ui, Some(icon), label, active)).inner.on_hover_text("Space").clicked() {
+                self.toggle_play();
+            }
+            ui.add_enabled_ui(can_play, |ui| {
+                let sel = |on: bool| if on { skin::Active::Teal } else { skin::Active::No };
+                if skin::button(ui, Some(skin::Icon::Lock), "固定", sel(!self.follow))
+                    .on_hover_text("解析位置を固定する。再生しても倍音分布は変わらない（比べるとき向き）")
+                    .clicked()
+                {
+                    self.follow = false;
+                }
+                if skin::button(ui, Some(skin::Icon::Unlock), "再生に追従", sel(self.follow))
+                    .on_hover_text(
+                        "再生中は、再生位置のフレームを解析位置にする。\n\
+                         グラフをクリック・ドラッグして解析位置を決めると「固定」に戻る。止めた位置はそのまま残る",
+                    )
+                    .clicked()
+                {
+                    self.follow = true;
+                }
+            });
+            ui.add_space(6.0);
+            if self.clip.is_some() {
+                let (label, active) =
+                    if self.show_settings { ("設定を隠す ▴", skin::Active::Teal) } else { ("設定 ▾", skin::Active::No) };
+                if skin::button(ui, Some(skin::Icon::Settings), label, active)
+                    .on_hover_text("基音・窓長・表示・試聴フィルタの設定")
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
+                }
+            }
             let busy = self.export.job.is_some();
             let label = if busy { "書き出し中…" } else { "AI解析用に書き出す…" };
-            if ui
-                .button(label)
+            if skin::button(ui, Some(skin::Icon::Export), label, skin::Active::No)
                 .on_hover_text("音声・全倍音の数値・解析条件・概要画像・要約を 1 つの ZIP に保存する（AI や外部のプログラムで調べる用）")
                 .clicked()
             {
                 self.export_defaults();
                 self.export.open = true;
             }
-            ui.separator();
-
-            let playing = self.player.is_playing();
-            let label = if playing { "■ 停止" } else { "▶ 再生" };
-            let can_play = self.clip.is_some() && self.live.is_none();
-            if ui.add_enabled(can_play, egui::Button::new(label)).on_hover_text("Space").clicked() {
-                self.toggle_play();
+            let help = if self.show_help { skin::Active::Teal } else { skin::Active::No };
+            if skin::button(ui, Some(skin::Icon::Help), "操作方法", help).clicked() {
+                self.show_help = !self.show_help;
             }
-            ui.label(RichText::new(format!("解析 {:.3} s", self.cursor)).color(CURSOR_COLOR))
-                .on_hover_text("解析位置（橙の縦線）");
-            ui.label(RichText::new(format!("再生 {:.3} s", self.player.position())).color(PLAYHEAD_COLOR))
+        });
+
+        // 2 行目: 時刻、試聴の状態、いま調べている音（常に見える）
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let mono = |text: String, color: Color32| RichText::new(text).monospace().size(15.0).color(color);
+            ui.label(mono(format!("解析 {:.3} s", self.cursor), CURSOR_COLOR)).on_hover_text("解析位置（橙の縦線）");
+            let playing = if self.player.is_playing() { skin::Lamp::Amber } else { skin::Lamp::Off };
+            skin::lamp(ui, playing).on_hover_text(if self.player.is_playing() { "再生中" } else { "停止中" });
+            ui.label(mono(format!("再生 {:.3} s", self.player.position()), PLAYHEAD_COLOR))
                 .on_hover_text("再生位置（緑の縦線）");
-            ui.add_enabled_ui(can_play, |ui| {
-                ui.selectable_value(&mut self.follow, false, "固定")
-                    .on_hover_text("解析位置を固定する。再生しても倍音分布は変わらない（比べるとき向き）");
-                ui.selectable_value(&mut self.follow, true, "再生に追従").on_hover_text(
-                    "再生中は、再生位置のフレームを解析位置にする。\n\
-                     グラフをクリック・ドラッグして解析位置を決めると「固定」に戻る。止めた位置はそのまま残る",
-                );
-            });
             ui.separator();
             self.listen_status(ui);
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("？ 操作方法").clicked() {
-                    self.show_help = !self.show_help;
-                }
-                if self.clip.is_some() {
-                    let label = if self.show_settings { "設定を隠す ▴" } else { "設定 ▾" };
-                    if ui.button(label).on_hover_text("基音・窓長・表示・試聴フィルタの設定").clicked() {
-                        self.show_settings = !self.show_settings;
-                    }
-                }
-                if let Some(e) = &self.player.error {
-                    ui.colored_label(Color32::LIGHT_RED, "再生不可").on_hover_text(e);
-                }
-                // 狭いときは名前を潰さず、次の行に出す
-                if ui.available_width() >= 240.0 {
-                    ui.separator();
-                    self.source_label(ui);
-                } else {
-                    label_below = true;
-                }
-            });
+            if let Some(e) = &self.player.error {
+                ui.colored_label(ERROR_COLOR, "再生不可").on_hover_text(e);
+            }
+            ui.separator();
+            self.source_label(ui);
         });
-        if label_below {
-            ui.horizontal(|ui| self.source_label(ui));
-        }
 
         // 2 行目以降: 用途ごとの設定。幅が足りなければ折り返す
         if self.clip.is_some() && self.show_settings {
@@ -947,7 +1013,7 @@ impl App {
         if let Some(e) = &self.error
             && !(self.show_settings && self.clip.is_some() && f0_err.as_ref() == Some(e))
         {
-            ui.colored_label(Color32::LIGHT_RED, e);
+            ui.colored_label(ERROR_COLOR, e);
         }
         ui.add_space(4.0);
     }
@@ -1013,6 +1079,15 @@ impl App {
                 BandMode::Remove => (format!("試聴: {lo:.0}–{hi:.0} Hz を除く"), REMOVE_COLOR, "この帯域を取り除いて鳴らしている"),
             }
         };
+        // ランプ: 元の音 = 消灯、残す = 青緑、除く・無音 = 赤（文字でも同じことを書く）
+        let lamp = if self.live.is_some() || !self.filter_on {
+            skin::Lamp::Off
+        } else if color == REMOVE_COLOR {
+            skin::Lamp::Red
+        } else {
+            skin::Lamp::Teal
+        };
+        skin::lamp(ui, lamp);
         ui.label(RichText::new(text).color(color)).on_hover_text(format!("{tip}\n解析・グラフは常に元の音"));
         if self.filter_on && self.live.is_none() && self.wanted_filter() != self.filter_applied && self.clip.is_some() {
             ui.spinner().on_hover_text("フィルタを掛けた音を準備中");
@@ -1069,7 +1144,7 @@ impl App {
                         ui.label(hint(ui, format!("（{name} {dev:+.1} cent）")));
                     }
                     Err(e) => {
-                        ui.colored_label(Color32::LIGHT_RED, e);
+                        ui.colored_label(ERROR_COLOR, e);
                     }
                 }
             });
@@ -1193,13 +1268,16 @@ impl App {
 
     fn live_controls(&mut self, ui: &mut egui::Ui) {
         let Some(live) = &self.live else {
-            if ui.button("● ライブ入力…").on_hover_text("入力元を選んでから、リアルタイムに解析する").clicked() {
+            if skin::button(ui, None, "● ライブ入力…", skin::Active::No)
+                .on_hover_text("入力元を選んでから、リアルタイムに解析する")
+                .clicked()
+            {
                 self.open_source_window();
             }
             return;
         };
-        if ui
-            .button(RichText::new("■ ライブ停止").color(LIVE_COLOR))
+        skin::lamp(ui, skin::Lamp::Red).on_hover_text("ライブ入力中");
+        if skin::button(ui, Some(skin::Icon::Stop), "ライブ停止", skin::Active::Amber)
             .on_hover_text("止めた時点の直近の音が残り、再生・解析・保存できる")
             .clicked()
         {
@@ -1209,14 +1287,14 @@ impl App {
         let peak = live.peak();
         let db = 20.0 * peak.max(1e-6).log10();
         let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-        let color = if peak >= 0.99 { Color32::RED } else { PLAYHEAD_COLOR };
+        let color = if peak >= 0.99 { skin::DANGER } else { PLAYHEAD_COLOR };
         ui.add(egui::ProgressBar::new(frac).desired_width(90.0).fill(color).text(format!("{db:.0} dBFS")))
             .on_hover_text("入力レベル（直近のピーク）。赤は振り切れ");
         if let Some(e) = live.error() {
-            ui.colored_label(Color32::LIGHT_RED, "入力エラー").on_hover_text(e);
+            ui.colored_label(ERROR_COLOR, "入力エラー").on_hover_text(e);
         }
         if live.is_app() && live.silent_so_far() {
-            ui.colored_label(Color32::from_rgb(255, 200, 60), "無音のまま").on_hover_text(
+            ui.colored_label(skin::AMBER, "無音のまま").on_hover_text(
                 "アプリが音を出していないか、システムオーディオ録音が許可されていません。\n\
                  システム設定 > プライバシーとセキュリティ > 画面収録とシステムオーディオ録音 で、\n\
                  このアプリ（.app から起動した場合）か起動元のターミナルを許可してください。\n\
@@ -1337,7 +1415,7 @@ impl App {
                 }
                 ui.label(RichText::new(format!("選択中: {}", self.source_text())).strong());
                 if let Some(e) = &self.error {
-                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.colored_label(ERROR_COLOR, e);
                 }
                 ui.horizontal(|ui| {
                     start = ui.button(RichText::new("● この入力元で開始").color(LIVE_COLOR)).clicked();
@@ -1410,26 +1488,26 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() * 0.08).max(12.0));
-                ui.label(RichText::new("倍音解析エディタ").size(26.0).strong());
+                skin::nameplate(ui, "Aurelian Instruments", "倍音解析エディタ", 26.0);
+                ui.add_space(8.0);
                 ui.label(hint(ui, "単音を読み込むと、倍音ごとの強さと時間変化を調べられます"));
                 ui.add_space(20.0);
-                let big = |text: &str| egui::Button::new(RichText::new(text).size(16.0)).min_size(egui::vec2(300.0, 36.0));
-                if ui.add(big("WAV を開く…")).clicked()
+                if skin::button(ui, Some(skin::Icon::Folder), "WAV を開く…", skin::Active::No).clicked()
                     && let Some(p) = rfd::FileDialog::new().add_filter("WAV", &["wav", "wave"]).pick_file()
                 {
                     self.open(p);
                 }
                 ui.label(hint(ui, "WAV ファイルをこのウィンドウへドラッグ＆ドロップしても開けます"));
                 ui.add_space(10.0);
-                if ui.add(big("● ライブ入力…")).clicked() {
+                if skin::button(ui, None, "● ライブ入力…", skin::Active::No).clicked() {
                     self.open_source_window();
                 }
                 ui.label(hint(ui, "マイク・オーディオインターフェイス・アプリの音を、入力元を確かめてから開始"));
                 ui.add_space(22.0);
-                ui.label(RichText::new("サンプルで試す（基音 220 Hz）").strong());
-                ui.add_space(4.0);
+                skin::plaque(ui, "サンプルで試す（基音 220 Hz）");
+                ui.add_space(6.0);
                 for (i, s) in SAMPLES.iter().enumerate() {
-                    if ui.add(egui::Button::new(s.title).min_size(egui::vec2(300.0, 28.0))).clicked() {
+                    if skin::button(ui, Some(skin::Icon::Play), s.title, skin::Active::No).clicked() {
                         self.open_sample(i);
                     }
                     ui.label(hint(ui, s.about));
@@ -1446,9 +1524,10 @@ impl App {
         };
         let frame = a.frame_at(self.cursor);
         let t = a.frame_time(frame);
+        let n = skin::panel(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("倍音分布").strong().size(17.0).color(ui.visuals().strong_text_color()));
-            ui.label(RichText::new(format!("t = {t:.3} s")).size(15.0).color(CURSOR_COLOR));
+            skin::plaque(ui, "倍音分布");
+            ui.label(RichText::new(format!("t = {t:.3} s")).monospace().size(15.0).color(CURSOR_COLOR));
         });
         ui.horizontal(|ui| {
             ui.label("棒の数");
@@ -1490,6 +1569,7 @@ impl App {
 
         let a_ref = a;
         let plot = Plot::new(("bars", self.generation))
+            .grid_color(skin::GRID_MAJOR)
             .height(ui.available_height() * 0.42)
             .x_axis_label("倍音番号")
             .y_axis_label("レベル (dB)")
@@ -1611,8 +1691,13 @@ impl App {
             }
         }
 
+        n
+        })
+        .inner;
+
         // 注目中の倍音の読み取り
-        ui.add_space(6.0);
+        ui.add_space(8.0);
+        skin::panel(ui, |ui| {
         if let Some(k) = self.focused {
             let txt = match a.level(frame, k) {
                 HarmonicLevel::Level { db, peak_hz, .. } => format!(
@@ -1630,7 +1715,9 @@ impl App {
         } else {
             ui.label(hint(ui, "注目中の倍音なし（棒か一覧の名前をクリックすると注目）"));
         }
-        ui.add_space(4.0);
+        });
+        ui.add_space(8.0);
+        skin::panel(ui, |ui| {
         let count = self.shown.in_range(a.num_in_range).count();
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("時間変化に表示: {count} 本")).strong());
@@ -1693,6 +1780,7 @@ impl App {
                 }
             });
         });
+        });
     }
 
     fn time_views(&mut self, ui: &mut egui::Ui) {
@@ -1726,6 +1814,7 @@ impl App {
                 .allow_scroll([true, false])
                 .allow_boxed_zoom(false)
                 .y_axis_min_width(64.0) // 3つのプロットの時間軸を横方向にそろえる
+                .grid_color(skin::GRID_MAJOR)
         };
         let draw_cursors = |pu: &mut egui_plot::PlotUi| {
             pu.vline(VLine::new("解析位置", cursor).color(CURSOR_COLOR).width(1.5));
@@ -1737,9 +1826,17 @@ impl App {
             if pu.response().clicked() { pu.pointer_coordinate().map(|p| p.x) } else { None }
         };
 
+        // 各グラフは真鍮の枠の中に置く。枠・見出しの分を除いた高さを 27 : 37 : 36 で配る
+        let gap = 8.0;
+        let chrome = 3.0 * (2.0 * 10.0 + PLAQUE_ROW + gap) + LEGEND_ROW;
+        let plots_h = (total_h - chrome).max(360.0);
+        let wave_h = (plots_h * 0.27).max(110.0);
+        let spec_h = (plots_h * 0.37).max(150.0);
+
         // 波形
+        let r = skin::panel(ui, |ui| {
         section_title(ui, "波形", |ui| {
-            ui.label(RichText::new("解析: 元の音").small().color(Color32::BLACK).background_color(CURSOR_COLOR))
+            ui.label(RichText::new("解析: 元の音").small().color(skin::INK).background_color(CURSOR_COLOR))
                 .on_hover_text("グラフと倍音分布は常に元の音。試聴フィルタは再生音だけに掛かる");
             let text = if live {
                 "ライブ入力: 右端が現在。解析位置は常に最新（止めると自由に調べられる）"
@@ -1750,7 +1847,7 @@ impl App {
         });
         let mono = &clip.mono;
         let sr = clip.sample_rate as f64;
-        let r = time_plot("wave", total_h * 0.18)
+        time_plot("wave", wave_h)
             .default_y_bounds(-1.0, 1.0)
             .y_axis_label("振幅")
             .label_formatter(|p| Some(format!("{:.3} s", hover_pos(p).x)))
@@ -1777,13 +1874,16 @@ impl App {
                     }
                     pu.add(
                         FilledArea::new("波形", &xs, &lo, &hi)
-                            .fill_color(Color32::from_rgb(110, 170, 255))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(110, 170, 255))),
+                            .fill_color(WAVE_COLOR.gamma_multiply(0.85))
+                            .stroke(Stroke::new(1.3, WAVE_COLOR)),
                     );
                 }
                 draw_cursors(pu);
                 (click_of(pu), seek_grab(pu, &grab_lines, seek_dragging))
-            });
+            })
+        })
+        .inner;
+        mark_cursor(ui, &r.transform, cursor);
         clicked = clicked.or(r.inner.0);
         self.view_time = Some((r.transform.bounds().min()[0], r.transform.bounds().max()[0]));
         merge(r.inner.1);
@@ -1796,12 +1896,13 @@ impl App {
         // スペクトログラム
         let f0 = a.f0;
         let nyq = a.nyquist();
+        ui.add_space(gap);
+        let r = skin::panel(ui, |ui| {
         section_title(ui, "スペクトログラム", |ui| {
             ui.add(egui::Label::new(hint(ui, "Shift+ドラッグで試聴帯域、帯の線はドラッグで調整")).truncate())
                 .on_hover_text("縦軸 Hz、色 = レベル。ほかの所のドラッグ／ホイールで移動・拡大");
         });
         let fmax = (f0 * (self.bar_count.min(16) as f64 + 1.0)).clamp(1000.0, nyq); // 既定は第16倍音付近まで
-        let spec = &a.spectrogram;
         let shift = ui.input(|i| i.modifiers.shift);
         let band = (self.filter_on && self.filter_kind == FilterKind::Band).then_some(self.band);
         // 「選択していない倍音をカット」で残る帯
@@ -1815,7 +1916,8 @@ impl App {
         let edge_drag = self.edge_drag;
         // 境界線をつかんでいる間・つかめる位置にある間はグラフ自体を動かさない
         let hold = shift || self.edge_hover.is_some() || edge_drag.is_some() || seek_hold;
-        let r = time_plot("spec", total_h * 0.33)
+        let spec = &a.spectrogram;
+        time_plot("spec", spec_h)
             .default_y_bounds(0.0, fmax)
             .allow_zoom([true, true])
             .allow_drag([!hold, !hold])
@@ -1915,7 +2017,10 @@ impl App {
                 };
                 let click = if edge_move.is_some() || hover_edge.is_some() { None } else { click_of(pu) };
                 (click, band_drag, hover_edge, edge_move, grab)
-            });
+            })
+        })
+        .inner;
+        mark_cursor(ui, &r.transform, cursor);
         let (spec_click, band_drag, hover_edge, edge_move, grab) = r.inner;
         self.view_freq = Some((r.transform.bounds().min()[1], r.transform.bounds().max()[1]));
         clicked = clicked.or(spec_click);
@@ -1948,6 +2053,8 @@ impl App {
         // 表示中の倍音の時間変化
         let on: Vec<usize> = self.shown.in_range(a.num_in_range).collect();
         let mut focus_click = None;
+        ui.add_space(gap);
+        let r = skin::panel(ui, |ui| {
         section_title(ui, "倍音の時間変化", |ui| {
             ui.add(egui::Label::new(hint(ui, "共通の dB 目盛り。● は解析位置の値。注目中の倍音以外は薄く表示")).truncate());
         });
@@ -1974,7 +2081,7 @@ impl App {
         let frame = a.frame_at(cursor);
         // 注目中の倍音が表示されていれば、ほかの線は半透明にしてその1本を際立たせる
         let focused = self.focused.filter(|k| on.contains(k));
-        let r = time_plot("tracks", ui.available_height().max(120.0))
+        time_plot("tracks", ui.available_height().max(120.0))
             .default_y_bounds(floor, 3.0)
             .x_axis_label("時間 (秒)")
             .y_axis_label("レベル (dB)")
@@ -2005,7 +2112,10 @@ impl App {
                 }
                 draw_cursors(pu);
                 (click_of(pu), seek_grab(pu, &grab_lines, seek_dragging))
-            });
+            })
+        })
+        .inner;
+        mark_cursor(ui, &r.transform, cursor);
         clicked = clicked.or(r.inner.0);
         self.view_level = Some((r.transform.bounds().min()[1], r.transform.bounds().max()[1]));
         merge(r.inner.1);

@@ -13,3 +13,16 @@ const CJK_CANDIDATES: [&str; 6] = [
 pub fn load_cjk_font() -> Option<Vec<u8>> {
     CJK_CANDIDATES.iter().find_map(|p| std::fs::read(p).ok())
 }
+
+/// 英字の銘板・見出し用に OS のセリフ体を探す（無ければ None。フォントは同梱しない）
+const SERIF_CANDIDATES: [&str; 5] = [
+    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+    "C:\\Windows\\Fonts\\georgia.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+];
+
+pub fn load_serif_font() -> Option<Vec<u8>> {
+    SERIF_CANDIDATES.iter().find_map(|p| std::fs::read(p).ok())
+}
