@@ -91,6 +91,35 @@ enum BandEdge {
 
 /// 境界線をつかめる距離（画面上のピクセル）
 const EDGE_GRAB_PX: f32 = 6.0;
+/// 解析位置・再生位置の縦線をつかめる距離（画面上のピクセル）
+const SEEK_GRAB_PX: f32 = 6.0;
+
+/// 時間グラフ上の縦線（解析位置・再生位置）のつかみ具合
+#[derive(Clone, Copy, Debug, Default)]
+struct SeekGrab {
+    /// 線の近くにカーソルがある
+    hover: bool,
+    /// ドラッグ中の位置（秒）と、ドラッグが終わったか
+    moved: Option<(f64, bool)>,
+}
+
+/// 縦線の近くでのドラッグを、グラフの移動ではなく位置の移動として扱う
+fn seek_grab(pu: &egui_plot::PlotUi, lines: &[f64], dragging: bool) -> SeekGrab {
+    let resp = pu.response();
+    let hover = resp.hover_pos().is_some_and(|p| {
+        lines.iter().any(|&t| (pu.screen_from_plot(PlotPoint::new(t, 0.0)).x - p.x).abs() <= SEEK_GRAB_PX)
+    });
+    let active = dragging || (hover && resp.drag_started());
+    let moved = if active && (resp.drag_started() || resp.dragged() || resp.drag_stopped()) {
+        // グラフの外へ出ても、横方向の位置だけは追う
+        resp.interact_pointer_pos()
+            .map(|p| pu.plot_from_screen(p).x)
+            .map(|t| (t, resp.drag_stopped()))
+    } else {
+        None
+    };
+    SeekGrab { hover, moved }
+}
 
 struct App {
     player: Player,
@@ -123,6 +152,10 @@ struct App {
     edge_hover: Option<BandEdge>,
     /// 境界線をドラッグ中
     edge_drag: Option<BandEdge>,
+    /// 解析位置・再生位置の縦線にカーソルが乗っているか（前フレーム）
+    seek_hover: bool,
+    /// 縦線をドラッグ中
+    seek_drag: bool,
 
     /// ライブ入力（動作中のみ Some）
     live: Option<LiveInput>,
@@ -168,6 +201,8 @@ impl Default for App {
             band_drag_start: None,
             edge_hover: None,
             edge_drag: None,
+            seek_hover: false,
+            seek_drag: false,
             live: None,
             live_devices: Vec::new(),
             live_apps: Vec::new(),
@@ -856,6 +891,16 @@ impl App {
         let floor = self.display_floor as f64;
         let total_h = ui.available_height();
         let mut clicked: Option<f64> = None;
+        // つかめる縦線（ライブ中は解析位置が最新に固定なので無し）
+        let live = self.live.is_some();
+        let grab_lines: Vec<f64> = if live { Vec::new() } else { std::iter::once(cursor).chain(playhead).collect() };
+        let seek_dragging = self.seek_drag;
+        let seek_hold = self.seek_hover || seek_dragging;
+        let mut seek = SeekGrab::default();
+        let mut merge = |g: SeekGrab| {
+            seek.hover |= g.hover;
+            seek.moved = seek.moved.or(g.moved);
+        };
 
         let time_plot = |name: &str, h: f32| {
             Plot::new((name.to_string(), self.generation))
@@ -864,7 +909,7 @@ impl App {
                 .link_cursor(link, [true, false])
                 .default_x_bounds(0.0, dur)
                 .allow_zoom([true, false])
-                .allow_drag([true, false])
+                .allow_drag([!seek_hold, false])
                 .allow_scroll([true, false])
                 .allow_boxed_zoom(false)
                 .y_axis_min_width(64.0) // 3つのプロットの時間軸を横方向にそろえる
@@ -883,7 +928,7 @@ impl App {
         let hint = if self.live.is_some() {
             "ライブ入力: 直近の音（右端が現在）。解析位置は常に最新。止めると自由に調べられる"
         } else {
-            "波形（クリックで解析位置・再生開始位置を指定、ドラッグ/ホイールで移動・拡大）"
+            "波形（クリックで解析位置・再生開始位置を指定、縦線はドラッグで動かせる。ほかの所のドラッグ/ホイールで移動・拡大）"
         };
         ui.label(RichText::new(hint).weak());
         let mono = &clip.mono;
@@ -920,11 +965,15 @@ impl App {
                     );
                 }
                 draw_cursors(pu);
-                click_of(pu)
+                (click_of(pu), seek_grab(pu, &grab_lines, seek_dragging))
             });
-        clicked = clicked.or(r.inner);
+        clicked = clicked.or(r.inner.0);
+        merge(r.inner.1);
 
-        let Some(a) = &self.analysis else { return };
+        let Some(a) = &self.analysis else {
+            self.finish_seek(ui, seek, dur);
+            return;
+        };
 
         // スペクトログラム
         ui.label(RichText::new("スペクトログラム（縦軸 Hz、色 = レベル。縦方向はドラッグ/ホイールで拡大）").weak());
@@ -937,7 +986,7 @@ impl App {
         let drag_start = self.band_drag_start;
         let edge_drag = self.edge_drag;
         // 境界線をつかんでいる間・つかめる位置にある間はグラフ自体を動かさない
-        let hold = shift || self.edge_hover.is_some() || edge_drag.is_some();
+        let hold = shift || self.edge_hover.is_some() || edge_drag.is_some() || seek_hold;
         let r = time_plot("spec", total_h * 0.36)
             .default_y_bounds(0.0, fmax)
             .allow_zoom([true, true])
@@ -988,8 +1037,11 @@ impl App {
                     );
                 }
                 draw_cursors(pu);
+                let grab = seek_grab(pu, &grab_lines, seek_dragging);
                 let resp = pu.response();
                 let y = pu.pointer_coordinate().map(|p| p.y.max(0.0));
+                // 縦線（解析位置）のほうを優先する
+                let band = band.filter(|_| !grab.hover && !seek_dragging);
                 // 境界線の近くにカーソルがあれば、その線をつかめる（近いほうを優先）
                 let hover_edge = match (band, resp.hover_pos()) {
                     (Some(b), Some(p)) if !shift => {
@@ -1026,10 +1078,11 @@ impl App {
                     None
                 };
                 let click = if edge_move.is_some() || hover_edge.is_some() { None } else { click_of(pu) };
-                (click, band_drag, hover_edge, edge_move)
+                (click, band_drag, hover_edge, edge_move, grab)
             });
-        let (spec_click, band_drag, hover_edge, edge_move) = r.inner;
+        let (spec_click, band_drag, hover_edge, edge_move, grab) = r.inner;
         clicked = clicked.or(spec_click);
+        merge(grab);
         self.edge_hover = hover_edge;
         if hover_edge.is_some() || self.edge_drag.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -1082,12 +1135,36 @@ impl App {
                     }
                 }
                 draw_cursors(pu);
-                click_of(pu)
+                (click_of(pu), seek_grab(pu, &grab_lines, seek_dragging))
             });
-        clicked = clicked.or(r.inner);
+        clicked = clicked.or(r.inner.0);
+        merge(r.inner.1);
 
         if let Some(t) = clicked {
             self.set_cursor(t.clamp(0.0, dur));
+        }
+        self.finish_seek(ui, seek, dur);
+    }
+
+    /// 縦線のドラッグを反映する。ドラッグ中は解析位置だけを動かし、離したときに再生位置も合わせる。
+    fn finish_seek(&mut self, ui: &egui::Ui, seek: SeekGrab, dur: f64) {
+        self.seek_hover = seek.hover;
+        if seek.hover || self.seek_drag {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if let Some((t, done)) = seek.moved {
+            let t = t.clamp(0.0, dur);
+            self.seek_drag = !done;
+            if done {
+                self.set_cursor(t);
+            } else {
+                self.cursor = match &self.analysis {
+                    Some(a) => a.frame_time(a.frame_at(t)),
+                    None => t,
+                };
+            }
+        } else if self.seek_drag && !ui.input(|i| i.pointer.any_down()) {
+            self.seek_drag = false;
         }
     }
 }
