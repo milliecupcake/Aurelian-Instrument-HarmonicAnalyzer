@@ -1,4 +1,4 @@
-//! 入力デバイス（マイク・オーディオインターフェイス）からの取り込み。
+//! 入力デバイス（マイク・オーディオインターフェイス）または特定のアプリの音の取り込み。
 //!
 //! 直近 `seconds` 秒をモノラル（全チャンネルの平均）でリングバッファに保持する。
 //! 解析は呼び出し側が `snapshot` で取り出した音に対して行う。
@@ -15,10 +15,27 @@ struct Ring {
     total: u64,
     /// 直近のブロックのピーク（入力レベル表示用）
     peak: f32,
+    /// 一度でも 0 でない音が来たか
+    heard: bool,
+}
+
+/// 何から取り込むか
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// 入力デバイス（None = 既定）
+    Device(Option<String>),
+    /// アプリが出している音（アプリ名）
+    App(String),
+}
+
+enum Backend {
+    Device(#[allow(dead_code)] cpal::Stream),
+    #[cfg(target_os = "macos")]
+    App(#[allow(dead_code)] crate::app_tap::AppTap),
 }
 
 pub struct LiveInput {
-    _stream: cpal::Stream,
+    _backend: Backend,
     ring: Arc<Mutex<Ring>>,
     pub sample_rate: u32,
     pub channels: usize,
@@ -41,9 +58,64 @@ pub fn input_device_names() -> Vec<String> {
     names
 }
 
+fn new_ring(seconds: f64, rate: u32) -> Arc<Mutex<Ring>> {
+    let len = (seconds * rate as f64).round() as usize;
+    Arc::new(Mutex::new(Ring { buf: vec![0.0; len.max(1)], write: 0, total: 0, peak: 0.0, heard: false }))
+}
+
+/// インターリーブされた音を、チャンネル平均のモノラルにしてリングへ書く
+fn push(ring: &Mutex<Ring>, data: &[f32], ch: usize) {
+    let Ok(mut r) = ring.lock() else { return };
+    let ch = ch.max(1);
+    let mut peak = 0f32;
+    for frame in data.chunks_exact(ch) {
+        let v = frame.iter().sum::<f32>() / ch as f32;
+        peak = peak.max(v.abs());
+        let w = r.write;
+        r.buf[w] = v;
+        r.write = (w + 1) % r.buf.len();
+    }
+    r.total += (data.len() / ch) as u64;
+    r.peak = peak;
+    r.heard |= peak > 0.0;
+}
+
 impl LiveInput {
+    pub fn open(source: &Source, seconds: f64) -> Result<Self, String> {
+        match source {
+            Source::Device(d) => Self::open_device(d.as_deref(), seconds),
+            Source::App(name) => Self::open_app(name, seconds),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_app(name: &str, seconds: f64) -> Result<Self, String> {
+        use crate::app_tap::{AppTap, list_audio_apps};
+        let app = list_audio_apps()
+            .into_iter()
+            .find(|a| a.name == name)
+            .ok_or_else(|| format!("「{name}」は音を出していません（一度音を鳴らしてから選び直してください）"))?;
+        let mut tap = AppTap::create(&app)?;
+        let ring = new_ring(seconds, tap.sample_rate);
+        let r = ring.clone();
+        tap.start(Box::new(move |data, ch| push(&r, data, ch)))?;
+        Ok(LiveInput {
+            sample_rate: tap.sample_rate,
+            channels: tap.channels,
+            device_name: format!("アプリ: {name}"),
+            _backend: Backend::App(tap),
+            ring,
+            error: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn open_app(_name: &str, _seconds: f64) -> Result<Self, String> {
+        Err("アプリの音の取り込みは macOS だけで使えます".into())
+    }
+
     /// `device` が None なら既定の入力デバイスを使う。
-    pub fn open(device: Option<&str>, seconds: f64) -> Result<Self, String> {
+    fn open_device(device: Option<&str>, seconds: f64) -> Result<Self, String> {
         let host = cpal::default_host();
         let dev = match device {
             Some(name) => host
@@ -59,8 +131,7 @@ impl LiveInput {
         let config = supported.config();
         let sample_rate = config.sample_rate;
         let channels = config.channels as usize;
-        let len = (seconds * sample_rate as f64).round() as usize;
-        let ring = Arc::new(Mutex::new(Ring { buf: vec![0.0; len.max(1)], write: 0, total: 0, peak: 0.0 }));
+        let ring = new_ring(seconds, sample_rate);
         let error = Arc::new(Mutex::new(None));
 
         let stream = match format {
@@ -71,7 +142,7 @@ impl LiveInput {
             f => return Err(format!("未対応の入力形式です: {f:?}")),
         }?;
         stream.play().map_err(|e| format!("入力を開始できません: {e}"))?;
-        Ok(LiveInput { _stream: stream, ring, sample_rate, channels, device_name, error })
+        Ok(LiveInput { _backend: Backend::Device(stream), ring, sample_rate, channels, device_name, error })
     }
 
     /// 直近の音（古い順）と、これまでに受け取ったサンプル数
@@ -86,6 +157,24 @@ impl LiveInput {
     /// 直近の入力ピーク（0..1）
     pub fn peak(&self) -> f32 {
         self.ring.lock().unwrap().peak
+    }
+
+    /// 2 秒以上受け取っているのに完全な無音のままか。
+    /// アプリの音は、macOS の許可が無いとエラーにならず 0 だけが届くので、その目安にする。
+    pub fn silent_so_far(&self) -> bool {
+        let r = self.ring.lock().unwrap();
+        !r.heard && r.total > 2 * self.sample_rate as u64
+    }
+
+    pub fn is_app(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            matches!(self._backend, Backend::App(_))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     pub fn error(&self) -> Option<String> {
@@ -104,20 +193,40 @@ fn build<T: SizedSample + Copy + Send + 'static>(
     dev.build_input_stream::<T, _, _>(
         config,
         move |data: &[T], _| {
-            let Ok(mut r) = ring.lock() else { return };
-            let mut peak = 0f32;
-            for frame in data.chunks(ch) {
-                let v = frame.iter().map(|&s| to_f32(s)).sum::<f32>() / ch as f32;
-                peak = peak.max(v.abs());
-                let w = r.write;
-                r.buf[w] = v;
-                r.write = (w + 1) % r.buf.len();
-            }
-            r.total += (data.len() / ch) as u64;
-            r.peak = peak;
+            let f: Vec<f32> = data.iter().map(|&s| to_f32(s)).collect();
+            push(&ring, &f, ch);
         },
         move |e| *error.lock().unwrap() = Some(e.to_string()),
         None,
     )
     .map_err(|e| format!("入力ストリームを作れません: {e}"))
+}
+
+/// 取り込めるアプリの名前と、いま音を出しているか（macOS 以外では空）
+pub fn audio_app_names() -> Vec<(String, bool)> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::app_tap::list_audio_apps().into_iter().map(|a| (a.name, a.playing)).collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_averages_channels_and_wraps() {
+        let ring = new_ring(1.0, 4);
+        push(&ring, &[1.0, 0.0, 0.5, 0.5, -1.0, -1.0], 2);
+        push(&ring, &[0.2, 0.2, 0.4, 0.4], 2);
+        let r = ring.lock().unwrap();
+        assert_eq!(r.total, 5);
+        // 4 サンプルのリング: 0.5, 0.5, -1.0, 0.2 の後に 0.4 が先頭を上書き
+        assert_eq!(r.buf, vec![0.4, 0.5, -1.0, 0.2]);
+        assert_eq!(r.write, 1);
+    }
 }

@@ -5,3 +5,5 @@ pub mod playback;
 pub mod test_tones;
 pub mod filter;
 pub mod live;
+#[cfg(target_os = "macos")]
+pub mod app_tap;

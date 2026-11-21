@@ -7,7 +7,7 @@ use egui_plot::{
 };
 use harmonic_analyzer::analysis::{Analysis, FLOOR_DB, HarmonicLevel, WindowSize, analyze, auto_window};
 use harmonic_analyzer::audio_file::{AudioClip, load_wav, write_wav_mono};
-use harmonic_analyzer::live::{LiveInput, input_device_names};
+use harmonic_analyzer::live::{LiveInput, Source, audio_app_names, input_device_names};
 use harmonic_analyzer::note::{nearest_note, parse_pitch};
 use harmonic_analyzer::filter::{self, Band, BandMode};
 use harmonic_analyzer::playback::Player;
@@ -127,8 +127,9 @@ struct App {
     /// ライブ入力（動作中のみ Some）
     live: Option<LiveInput>,
     live_devices: Vec<String>,
-    /// None = 既定の入力デバイス
-    live_device: Option<String>,
+    /// 取り込めるアプリ（名前, いま音を出しているか）
+    live_apps: Vec<(String, bool)>,
+    live_source: Source,
     /// 最後に解析へ回した時点の受信サンプル数
     live_seen: u64,
     live_last: Instant,
@@ -169,7 +170,8 @@ impl Default for App {
             edge_drag: None,
             live: None,
             live_devices: Vec::new(),
-            live_device: None,
+            live_apps: Vec::new(),
+            live_source: Source::Device(None),
             live_seen: 0,
             live_last: Instant::now(),
             live_job: None,
@@ -254,7 +256,7 @@ impl App {
 
     fn start_live(&mut self) {
         self.player.stop();
-        match LiveInput::open(self.live_device.as_deref(), LIVE_SECONDS) {
+        match LiveInput::open(&self.live_source, LIVE_SECONDS) {
             Ok(live) => {
                 let silent = vec![0.0; (LIVE_SECONDS * live.sample_rate as f64).round() as usize];
                 self.clip = Some(AudioClip::from_mono(silent, live.sample_rate));
@@ -429,7 +431,11 @@ impl eframe::App for App {
                         self.filter_on = true;
                     }
                 }
-                if std::env::var("HA_LIVE").is_ok() {
+                if let Ok(src) = std::env::var("HA_LIVE") {
+                    // HA_LIVE=1 は既定の入力、HA_LIVE=app:名前 はアプリの音
+                    if let Some(name) = src.strip_prefix("app:") {
+                        self.live_source = Source::App(name.to_string());
+                    }
                     self.start_live();
                 }
                 if let Ok(list) = std::env::var("HA_SELECT") {
@@ -606,20 +612,47 @@ impl App {
             if let Some(e) = live.error() {
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
+            if live.is_app() && live.silent_so_far() {
+                ui.colored_label(Color32::from_rgb(255, 200, 60), "無音のまま")
+                    .on_hover_text(
+                        "アプリが音を出していないか、システムオーディオ録音が許可されていません。\n\
+                         システム設定 > プライバシーとセキュリティ > 画面収録とシステムオーディオ録音 で、\n\
+                         このアプリ（.app から起動した場合）か起動元のターミナルを許可してください。\n\
+                         アプリを選んだ後に始まった音のプロセスは入らないので、そのときは選び直してください。",
+                    );
+            }
             return;
         }
         if ui.button("● ライブ入力").on_hover_text("入力デバイスの音を、直近の数秒ずつリアルタイムに解析する").clicked() {
             self.start_live();
         }
-        let current = self.live_device.clone().unwrap_or_else(|| "既定の入力".into());
-        let r = egui::ComboBox::from_id_salt("live-device").selected_text(current).width(180.0).show_ui(ui, |ui| {
-            ui.selectable_value(&mut self.live_device, None, "既定の入力");
+        let current = match &self.live_source {
+            Source::Device(None) => "既定の入力".to_string(),
+            Source::Device(Some(n)) => n.clone(),
+            Source::App(n) => format!("アプリ: {n}"),
+        };
+        let r = egui::ComboBox::from_id_salt("live-source").selected_text(current).width(200.0).show_ui(ui, |ui| {
+            ui.label(RichText::new("入力デバイス").weak());
+            ui.selectable_value(&mut self.live_source, Source::Device(None), "既定の入力");
             for name in &self.live_devices {
-                ui.selectable_value(&mut self.live_device, Some(name.clone()), name);
+                ui.selectable_value(&mut self.live_source, Source::Device(Some(name.clone())), name);
+            }
+            if cfg!(target_os = "macos") {
+                ui.separator();
+                ui.label(RichText::new("アプリの音（● = いま音を出している）").weak());
+                if self.live_apps.is_empty() {
+                    ui.label(RichText::new("音を出したアプリがありません").weak());
+                }
+                for (name, playing) in &self.live_apps {
+                    let label = format!("{} {name}", if *playing { "●" } else { "○" });
+                    ui.selectable_value(&mut self.live_source, Source::App(name.clone()), label);
+                }
             }
         });
         if r.response.clicked() {
+            // 開いたときに一覧を取り直す
             self.live_devices = input_device_names();
+            self.live_apps = audio_app_names();
         }
     }
 
