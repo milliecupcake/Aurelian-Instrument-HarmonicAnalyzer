@@ -72,6 +72,16 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 試聴フィルタの境界線（下限／上限）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BandEdge {
+    Low,
+    High,
+}
+
+/// 境界線をつかめる距離（画面上のピクセル）
+const EDGE_GRAB_PX: f32 = 6.0;
+
 struct App {
     player: Player,
     path: Option<PathBuf>,
@@ -99,6 +109,10 @@ struct App {
     filter_applied: Option<Band>,
     /// スペクトログラム上で Shift+ドラッグ中の開始周波数
     band_drag_start: Option<f64>,
+    /// スペクトログラム上で境界線にカーソルが乗っているか（前フレーム）
+    edge_hover: Option<BandEdge>,
+    /// 境界線をドラッグ中
+    edge_drag: Option<BandEdge>,
 
     spec_texture: Option<egui::TextureHandle>,
     spec_dirty: bool,
@@ -130,6 +144,8 @@ impl Default for App {
             band: Band { low_hz: 600.0, high_hz: 900.0, mode: BandMode::Keep },
             filter_applied: None,
             band_drag_start: None,
+            edge_hover: None,
+            edge_drag: None,
             spec_texture: None,
             spec_dirty: true,
             generation: 0,
@@ -444,15 +460,11 @@ impl App {
         ui.checkbox(&mut self.filter_on, RichText::new("試聴フィルタ").strong())
             .on_hover_text("再生する音だけに掛かる。解析・グラフは元の音のまま");
         ui.add_enabled_ui(self.filter_on, |ui| {
-            egui::ComboBox::from_id_salt("band-mode")
-                .selected_text(match self.band.mode {
-                    BandMode::Keep => "範囲だけ聴く",
-                    BandMode::Remove => "範囲をカットして聴く",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.band.mode, BandMode::Keep, "範囲だけ聴く");
-                    ui.selectable_value(&mut self.band.mode, BandMode::Remove, "範囲をカットして聴く");
-                });
+            ui.selectable_value(&mut self.band.mode, BandMode::Keep, "範囲外をカット（範囲内だけ鳴らす）")
+                .on_hover_text("指定した帯域だけを残すバンドパス。スペクトログラムでは水色");
+            ui.selectable_value(&mut self.band.mode, BandMode::Remove, "範囲内をカット")
+                .on_hover_text("指定した帯域だけを取り除くバンドストップ。スペクトログラムでは赤");
+            ui.separator();
             let hi = self.band.high_hz;
             ui.add(egui::DragValue::new(&mut self.band.low_hz).range(0.0..=hi).speed(1.0).suffix(" Hz").max_decimals(1));
             ui.label("〜");
@@ -471,7 +483,7 @@ impl App {
         });
         ui.label(
             RichText::new(format!(
-                "スペクトログラム上で Shift+ドラッグでも範囲を指定できる。境界はなだらか（幅 {:.0}〜{:.0} Hz）",
+                "Shift+ドラッグで範囲指定、上下の線は個別にドラッグ可。境界の幅 {:.0}〜{:.0} Hz",
                 filter::transition_width(self.band.low_hz),
                 filter::transition_width(self.band.high_hz)
             ))
@@ -717,10 +729,13 @@ impl App {
         let shift = ui.input(|i| i.modifiers.shift);
         let band = self.filter_on.then_some(self.band);
         let drag_start = self.band_drag_start;
+        let edge_drag = self.edge_drag;
+        // 境界線をつかんでいる間・つかめる位置にある間はグラフ自体を動かさない
+        let hold = shift || self.edge_hover.is_some() || edge_drag.is_some();
         let r = time_plot("spec", total_h * 0.36)
             .default_y_bounds(0.0, fmax)
             .allow_zoom([true, true])
-            .allow_drag([!shift, !shift])
+            .allow_drag([!hold, !hold])
             .allow_scroll([true, true])
             .y_axis_label("周波数 (Hz)")
             .label_formatter(|p| {
@@ -767,10 +782,35 @@ impl App {
                     );
                 }
                 draw_cursors(pu);
-                // Shift+ドラッグで試聴フィルタの範囲を指定
                 let resp = pu.response();
                 let y = pu.pointer_coordinate().map(|p| p.y.max(0.0));
-                let band_drag = if shift && resp.drag_started() {
+                // 境界線の近くにカーソルがあれば、その線をつかめる（近いほうを優先）
+                let hover_edge = match (band, resp.hover_pos()) {
+                    (Some(b), Some(p)) if !shift => {
+                        let dist = |hz: f64| (pu.screen_from_plot(PlotPoint::new(0.0, hz)).y - p.y).abs();
+                        let (dl, dh) = (dist(b.low_hz), dist(b.high_hz));
+                        if dl.min(dh) > EDGE_GRAB_PX {
+                            None
+                        } else if dh <= dl {
+                            Some(BandEdge::High)
+                        } else {
+                            Some(BandEdge::Low)
+                        }
+                    }
+                    _ => None,
+                };
+                // 境界線のドラッグ: (どちらの線, 新しい周波数, 終了したか)
+                let edge_move = if let Some(e) = edge_drag.or(hover_edge.filter(|_| resp.drag_started()))
+                    && (resp.drag_started() || resp.dragged() || resp.drag_stopped())
+                {
+                    y.map(|y| (e, y, resp.drag_stopped()))
+                } else {
+                    None
+                };
+                // Shift+ドラッグで試聴フィルタの範囲を指定
+                let band_drag = if edge_move.is_some() {
+                    None
+                } else if shift && resp.drag_started() {
                     y.map(|y| (y, y, false))
                 } else if let (Some(s), Some(y)) = (drag_start, y)
                     && (resp.dragged() || resp.drag_stopped())
@@ -779,10 +819,25 @@ impl App {
                 } else {
                     None
                 };
-                (click_of(pu), band_drag)
+                let click = if edge_move.is_some() || hover_edge.is_some() { None } else { click_of(pu) };
+                (click, band_drag, hover_edge, edge_move)
             });
-        let (spec_click, band_drag) = r.inner;
+        let (spec_click, band_drag, hover_edge, edge_move) = r.inner;
         clicked = clicked.or(spec_click);
+        self.edge_hover = hover_edge;
+        if hover_edge.is_some() || self.edge_drag.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if let Some((e, y, done)) = edge_move {
+            self.edge_drag = (!done).then_some(e);
+            // 上下の線は入れ替わらない（1 Hz 以上あける）
+            match e {
+                BandEdge::Low => self.band.low_hz = y.min(self.band.high_hz - 1.0).max(0.0),
+                BandEdge::High => self.band.high_hz = y.max(self.band.low_hz + 1.0).min(nyq),
+            }
+        } else if self.edge_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.edge_drag = None;
+        }
         if let Some((s, y, done)) = band_drag {
             self.band_drag_start = (!done).then_some(s);
             let (lo, hi) = (s.min(y), s.max(y).min(nyq));
