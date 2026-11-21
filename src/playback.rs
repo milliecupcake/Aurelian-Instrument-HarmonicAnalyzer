@@ -36,7 +36,13 @@ impl Player {
 
     pub fn set_clip(&self, interleaved: &[f32], channels: usize, rate: u32) {
         self.stop();
-        let clip = Clip { data: interleaved.to_vec(), channels, rate, frames: interleaved.len() / channels.max(1) };
+        self.replace_audio(interleaved.to_vec(), channels, rate);
+    }
+
+    /// 再生を止めずに音声を差し替える（フィルタの変更用）。再生位置はそのまま。
+    pub fn replace_audio(&self, data: Vec<f32>, channels: usize, rate: u32) {
+        let frames = data.len() / channels.max(1);
+        let clip = Clip { data, channels, rate, frames };
         *self.shared.clip.lock().unwrap() = Some(Arc::new(clip));
     }
 

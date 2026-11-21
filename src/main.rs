@@ -8,6 +8,7 @@ use egui_plot::{
 use harmonic_analyzer::analysis::{Analysis, FLOOR_DB, HarmonicLevel, WindowSize, analyze, auto_window};
 use harmonic_analyzer::audio_file::{AudioClip, load_wav};
 use harmonic_analyzer::note::{nearest_note, parse_pitch};
+use harmonic_analyzer::filter::{self, Band, BandMode};
 use harmonic_analyzer::playback::Player;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -91,6 +92,14 @@ struct App {
     display_floor: f32,
     show_harmonic_guides: bool,
 
+    /// 試聴フィルタ（再生音だけに掛ける）
+    filter_on: bool,
+    band: Band,
+    /// いまプレーヤーに入っている音に掛かっているフィルタ（None = 元の音）
+    filter_applied: Option<Band>,
+    /// スペクトログラム上で Shift+ドラッグ中の開始周波数
+    band_drag_start: Option<f64>,
+
     spec_texture: Option<egui::TextureHandle>,
     spec_dirty: bool,
     /// ファイルを開くたびに増やし、プロットの表示範囲をリセットする
@@ -117,6 +126,10 @@ impl Default for App {
             bar_count: 32,
             display_floor: -100.0,
             show_harmonic_guides: true,
+            filter_on: false,
+            band: Band { low_hz: 600.0, high_hz: 900.0, mode: BandMode::Keep },
+            filter_applied: None,
+            band_drag_start: None,
             spec_texture: None,
             spec_dirty: true,
             generation: 0,
@@ -130,6 +143,7 @@ impl App {
         match load_wav(&path) {
             Ok(clip) => {
                 self.player.set_clip(&clip.interleaved, clip.channels, clip.sample_rate);
+                self.filter_applied = None; // 新しい音は元のまま入る。必要なら次のフレームで掛け直す
                 self.cursor = (clip.duration() * 0.25).min(0.5);
                 self.clip = Some(clip);
                 self.path = Some(path);
@@ -138,6 +152,21 @@ impl App {
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// フィルタ設定が変わっていて、マウスを離していれば、再生する音を作り直す
+    fn sync_filter(&mut self, ctx: &egui::Context) {
+        let Some(clip) = &self.clip else { return };
+        let wanted = self.filter_on.then_some(self.band);
+        if wanted == self.filter_applied || ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let data = match &wanted {
+            Some(b) => filter::apply(&clip.interleaved, clip.channels, clip.sample_rate, b),
+            None => clip.interleaved.clone(),
+        };
+        self.player.replace_audio(data, clip.channels, clip.sample_rate);
+        self.filter_applied = wanted;
     }
 
     /// 基音の指定（音名/Hz + チューニング補正）から実際に使う周波数
@@ -259,11 +288,22 @@ impl eframe::App for App {
         if self.spec_dirty {
             self.rebuild_spec_texture(&ctx);
         }
+        self.sync_filter(&ctx);
         self.frames += 1;
         if let Ok(path) = std::env::var("HA_SCREENSHOT") {
             if self.frames == 1 {
                 if let Ok(t) = std::env::var("HA_CURSOR").map(|v| v.parse::<f64>().unwrap_or(0.0)) {
                     self.set_cursor(t);
+                }
+                // 例: HA_FILTER=600-900 または 600-900:cut
+                if let Ok(f) = std::env::var("HA_FILTER") {
+                    let (range, mode) = f.split_once(':').unwrap_or((&f, "keep"));
+                    if let Some((lo, hi)) = range.split_once('-') {
+                        self.band.low_hz = lo.parse().unwrap_or(0.0);
+                        self.band.high_hz = hi.parse().unwrap_or(0.0);
+                        self.band.mode = if mode == "cut" { BandMode::Remove } else { BandMode::Keep };
+                        self.filter_on = true;
+                    }
                 }
                 if let Ok(list) = std::env::var("HA_SELECT") {
                     self.selected = list.split(',').filter_map(|v| v.trim().parse().ok()).collect();
@@ -394,7 +434,52 @@ impl App {
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
         });
+
+        ui.horizontal(|ui| self.filter_controls(ui));
         ui.add_space(4.0);
+    }
+
+    fn filter_controls(&mut self, ui: &mut egui::Ui) {
+        let nyq = self.clip.as_ref().map(|c| c.sample_rate as f64 / 2.0).unwrap_or(24000.0);
+        ui.checkbox(&mut self.filter_on, RichText::new("試聴フィルタ").strong())
+            .on_hover_text("再生する音だけに掛かる。解析・グラフは元の音のまま");
+        ui.add_enabled_ui(self.filter_on, |ui| {
+            egui::ComboBox::from_id_salt("band-mode")
+                .selected_text(match self.band.mode {
+                    BandMode::Keep => "範囲だけ聴く",
+                    BandMode::Remove => "範囲をカットして聴く",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.band.mode, BandMode::Keep, "範囲だけ聴く");
+                    ui.selectable_value(&mut self.band.mode, BandMode::Remove, "範囲をカットして聴く");
+                });
+            let hi = self.band.high_hz;
+            ui.add(egui::DragValue::new(&mut self.band.low_hz).range(0.0..=hi).speed(1.0).suffix(" Hz").max_decimals(1));
+            ui.label("〜");
+            let lo = self.band.low_hz;
+            ui.add(egui::DragValue::new(&mut self.band.high_hz).range(lo..=nyq).speed(1.0).suffix(" Hz").max_decimals(1));
+            if let (Some(k), Some(a)) = (self.focused, &self.analysis)
+                && a.is_in_range(k)
+                && ui
+                    .button(format!("第{k}倍音の周り"))
+                    .on_hover_text("注目中の倍音 ± 基音の半分（隣の倍音の手前まで）")
+                    .clicked()
+            {
+                self.band.low_hz = (k as f64 - 0.5) * a.f0;
+                self.band.high_hz = ((k as f64 + 0.5) * a.f0).min(nyq);
+            }
+        });
+        ui.label(
+            RichText::new(format!(
+                "スペクトログラム上で Shift+ドラッグでも範囲を指定できる。境界はなだらか（幅 {:.0}〜{:.0} Hz）",
+                filter::transition_width(self.band.low_hz),
+                filter::transition_width(self.band.high_hz)
+            ))
+            .weak(),
+        );
+        if self.filter_on && Some(self.band) != self.filter_applied && self.clip.is_some() {
+            ui.spinner();
+        }
     }
 
     fn harmonic_panel(&mut self, ui: &mut egui::Ui) {
@@ -629,10 +714,13 @@ impl App {
         let nyq = a.nyquist();
         let fmax = (f0 * (self.bar_count.min(16) as f64 + 1.0)).clamp(1000.0, nyq); // 既定は第16倍音付近まで
         let spec = &a.spectrogram;
+        let shift = ui.input(|i| i.modifiers.shift);
+        let band = self.filter_on.then_some(self.band);
+        let drag_start = self.band_drag_start;
         let r = time_plot("spec", total_h * 0.36)
             .default_y_bounds(0.0, fmax)
             .allow_zoom([true, true])
-            .allow_drag([true, true])
+            .allow_drag([!shift, !shift])
             .allow_scroll([true, true])
             .y_axis_label("周波数 (Hz)")
             .label_formatter(|p| {
@@ -666,10 +754,44 @@ impl App {
                         );
                     }
                 }
+                if let Some(b) = band {
+                    let (fill, edge) = match b.mode {
+                        BandMode::Keep => (Color32::from_rgba_unmultiplied(80, 220, 255, 35), Color32::from_rgb(80, 220, 255)),
+                        BandMode::Remove => (Color32::from_rgba_unmultiplied(255, 80, 80, 45), Color32::from_rgb(255, 90, 90)),
+                    };
+                    pu.span(
+                        Span::new("試聴フィルタ", b.low_hz..=b.high_hz)
+                            .axis(egui_plot::Axis::Y)
+                            .fill(fill)
+                            .border(Stroke::new(1.5, edge)),
+                    );
+                }
                 draw_cursors(pu);
-                click_of(pu)
+                // Shift+ドラッグで試聴フィルタの範囲を指定
+                let resp = pu.response();
+                let y = pu.pointer_coordinate().map(|p| p.y.max(0.0));
+                let band_drag = if shift && resp.drag_started() {
+                    y.map(|y| (y, y, false))
+                } else if let (Some(s), Some(y)) = (drag_start, y)
+                    && (resp.dragged() || resp.drag_stopped())
+                {
+                    Some((s, y, resp.drag_stopped()))
+                } else {
+                    None
+                };
+                (click_of(pu), band_drag)
             });
-        clicked = clicked.or(r.inner);
+        let (spec_click, band_drag) = r.inner;
+        clicked = clicked.or(spec_click);
+        if let Some((s, y, done)) = band_drag {
+            self.band_drag_start = (!done).then_some(s);
+            let (lo, hi) = (s.min(y), s.max(y).min(nyq));
+            if hi - lo > 1.0 {
+                self.band.low_hz = lo;
+                self.band.high_hz = hi;
+                self.filter_on = true;
+            }
+        }
 
         // 選んだ倍音の時間変化
         ui.label(RichText::new("選んだ倍音の時間変化（共通の dB 目盛り）").weak());
